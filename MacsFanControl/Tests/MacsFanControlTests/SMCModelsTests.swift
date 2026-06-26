@@ -7,7 +7,15 @@
 //
 
 import XCTest
+import SwiftUI
 @testable import MacsFanControlCore
+
+// Mirror the literal Color constants used in Fan.loadColor / SensorKind.accent.
+// Those live in Core inside #if canImport(SwiftUI), as raw Color(red:green:blue:)
+// literals — NOT the UI target's Color.mfc* tokens (which the test target can't see).
+private let coreGreen = Color(red: 0.35, green: 0.85, blue: 0.55)
+private let coreAmber = Color(red: 1.0, green: 0.63, blue: 0.20)
+private let coreRed = Color(red: 1.0, green: 0.35, blue: 0.35)
 
 final class SMCModelsTests: XCTestCase {
 
@@ -50,28 +58,28 @@ final class SMCModelsTests: XCTestCase {
     @MainActor
     func testFanLoadColorIdleIsGreen() {
         let fan = makeFan(currentRPM: 1200) // 0% load
-        XCTAssertEqual(fan.loadColor, .mfcGreen)
+        XCTAssertEqual(fan.loadColor, coreGreen)
     }
 
     @MainActor
     func testFanLoadColorLowMidIsGreen() {
         // 35% load -> still under 0.4 threshold
         let fan = makeFan(currentRPM: 1200 + Int(0.35 * Double(5800 - 1200)))
-        XCTAssertEqual(fan.loadColor, .mfcGreen)
+        XCTAssertEqual(fan.loadColor, coreGreen)
     }
 
     @MainActor
     func testFanLoadColorMidIsAmber() {
         // 50% load -> 0.4 ..< 0.75
         let fan = makeFan(currentRPM: 3500)
-        XCTAssertEqual(fan.loadColor, .mfcAmber)
+        XCTAssertEqual(fan.loadColor, coreAmber)
     }
 
     @MainActor
     func testFanLoadColorHighIsRed() {
         // 90% load -> >= 0.75
         let fan = makeFan(currentRPM: 1200 + Int(0.9 * Double(5800 - 1200)))
-        XCTAssertEqual(fan.loadColor, .mfcRed)
+        XCTAssertEqual(fan.loadColor, coreRed)
     }
 
     // MARK: - TempSensor.fahrenheit
