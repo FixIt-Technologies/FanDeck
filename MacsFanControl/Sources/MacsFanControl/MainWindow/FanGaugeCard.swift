@@ -141,17 +141,20 @@ struct DraggableRPMGauge: View {
                     .onChanged { g in
                         isDragging = true
                         let rpm = rpmFor(x: g.location.x, totalWidth: geo.size.width)
-                        dragRPM = rpm
+                        // Only commit if it actually changed — avoids redundant
+                        // republishes during fine sub-pixel drags.
+                        if dragRPM != rpm {
+                            dragRPM = rpm
+                            onSetManual(rpm)
+                        }
                     }
                     .onEnded { g in
                         let rpm = rpmFor(x: g.location.x, totalWidth: geo.size.width)
                         onSetManual(rpm)
-                        // Keep dragRPM until the new mode is reflected, then clear so
-                        // `activeManualRPM()` reads from fan.mode (`.constant(rpm:)`).
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                            dragRPM = nil
-                            isDragging = false
-                        }
+                        // Clear dragRPM right away — fan.mode is .constant(rpm:) now,
+                        // so `activeManualRPM()` already returns the right value.
+                        dragRPM = nil
+                        isDragging = false
                     }
             )
             .help(helpText)
