@@ -1,0 +1,18 @@
+{
+  "name": "genesis-fan-control-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Build + install + restart scripts for GenesisFanControl.app",
+  "scripts": {
+    "build": "swift build -c release",
+    "build:debug": "swift build",
+    "start": "bun run scripts/install.ts",
+    "start:debug": "bun run scripts/install.ts -- --debug",
+    "dev": "bun run scripts/dev.ts",
+    "install:app": "bun run scripts/install.ts",
+    "icon": "swift scripts/build-icon.swift",
+    "test": "swift test",
+    "clean": "swift package clean",
+    "uninstall:app": "bun run scripts/uninstall.ts"
+  }
+}

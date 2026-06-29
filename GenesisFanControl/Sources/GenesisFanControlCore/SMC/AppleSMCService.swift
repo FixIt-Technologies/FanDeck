@@ -1,0 +1,558 @@
+//
+//  AppleSMCService.swift
+//  GenesisFanControlCore
+//
+//  Real System Management Controller backend via IOKit. Talks to the
+//  AppleSMC IOService using the standard 80-byte SMCParamStruct.
+//
+//  - Reads are unprivileged.
+//  - Writes (mode/target RPM) require root on most Macs; we attempt them
+//    anyway and log the SMC `result` byte on failure so the caller can
+//    surface "needs sudo / privileged helper" in the UI.
+//
+
+import Foundation
+import IOKit
+
+// MARK: - Wire-level SMC types
+
+private typealias SMCBytes32 = (
+    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+)
+
+private struct SMCVersion {
+    var major: UInt8 = 0
+    var minor: UInt8 = 0
+    var build: UInt8 = 0
+    var reserved: UInt8 = 0
+    var release: UInt16 = 0
+}
+
+private struct SMCPLimitData {
+    var version: UInt16 = 0
+    var length: UInt16 = 0
+    var cpuPLimit: UInt32 = 0
+    var gpuPLimit: UInt32 = 0
+    var memPLimit: UInt32 = 0
+}
+
+private struct SMCKeyInfoData {
+    var dataSize: UInt32 = 0
+    var dataType: UInt32 = 0
+    var dataAttributes: UInt8 = 0
+    // Explicit trailing pad — the C struct is 12 bytes; Swift would
+    // otherwise pack it down to 9 and the kernel rejects the call.
+    var _pad0: UInt8 = 0
+    var _pad1: UInt8 = 0
+    var _pad2: UInt8 = 0
+}
+
+private struct SMCParamStruct {
+    var key: UInt32 = 0
+    var vers: SMCVersion = .init()
+    var pLimitData: SMCPLimitData = .init()
+    var keyInfo: SMCKeyInfoData = .init()
+    var result: UInt8 = 0
+    var status: UInt8 = 0
+    var data8: UInt8 = 0
+    var data32: UInt32 = 0
+    var bytes: SMCBytes32 = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                              0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+}
+
+private enum SMCCall: UInt8 {
+    case readKey    = 5
+    case writeKey   = 6
+    case getKeyInfo = 9
+}
+
+private let kSMCHandleYPCEvent: UInt32 = 2
+
+// MARK: - Helpers
+
+@inline(__always)
+private func fourCC(_ s: String) -> UInt32 {
+    precondition(s.utf8.count == 4, "SMC keys are 4 bytes")
+    var v: UInt32 = 0
+    for b in s.utf8 { v = (v << 8) | UInt32(b) }
+    return v
+}
+
+@inline(__always)
+private func fourCCString(_ k: UInt32) -> String {
+    let bytes: [UInt8] = [
+        UInt8((k >> 24) & 0xFF),
+        UInt8((k >> 16) & 0xFF),
+        UInt8((k >> 8) & 0xFF),
+        UInt8(k & 0xFF),
+    ]
+    return String(bytes: bytes, encoding: .ascii) ?? ""
+}
+
+/// Decode the 32-byte payload by type tag.
+private enum SMCDecoder {
+    static func toDouble(type: UInt32, size: UInt32, bytes: SMCBytes32) -> Double? {
+        var b = bytes
+        return withUnsafeBytes(of: &b) { raw -> Double? in
+            let p = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            switch fourCCString(type) {
+            case "ui8 ":
+                return Double(p[0])
+            case "ui16":
+                let v = (UInt16(p[0]) << 8) | UInt16(p[1])
+                return Double(v)
+            case "ui32":
+                let v = (UInt32(p[0]) << 24) | (UInt32(p[1]) << 16) | (UInt32(p[2]) << 8) | UInt32(p[3])
+                return Double(v)
+            case "si8 ":
+                return Double(Int8(bitPattern: p[0]))
+            case "si16":
+                let raw = (UInt16(p[0]) << 8) | UInt16(p[1])
+                return Double(Int16(bitPattern: raw))
+            case "fpe2":
+                let raw = (UInt16(p[0]) << 8) | UInt16(p[1])
+                return Double(raw) / 4.0     // 14-bit int, 2-bit fraction
+            case "sp78":
+                let raw = Int16(bitPattern: (UInt16(p[0]) << 8) | UInt16(p[1]))
+                return Double(raw) / 256.0   // signed 8.8 fixed-point
+            case "flt ":
+                var f: Float = 0
+                memcpy(&f, p, 4)
+                return Double(f)
+            default:
+                return nil
+            }
+        }
+    }
+
+    /// Encode an integer RPM into the 2-byte fpe2 payload most fan targets use.
+    static func encodeFPE2(_ value: Int) -> (UInt8, UInt8) {
+        let raw = UInt16(max(0, min(0x3FFF, value))) << 2   // 14.2 fixed
+        return (UInt8(raw >> 8), UInt8(raw & 0xFF))
+    }
+}
+
+// MARK: - AppleSMCService
+
+public final class AppleSMCService: SMCService, @unchecked Sendable {
+    public let backendName = "AppleSMC"
+    public let isSimulated = false
+
+    private var connection: io_connect_t = 0
+    private var fanIndices: [Int] = []
+    private var sensorKeys: [(key: String, name: String, kind: SensorKind)] = []
+    private var cachedFans: [Fan] = []
+    private var cachedSensors: [TempSensor] = []
+    /// Routes writes through the privileged helper when direct SMC writes
+    /// hit `kIOReturnNotPrivileged`. Set on construction; can be probed
+    /// lazily later when the helper is installed.
+    private let helperClient: HelperClient
+    /// Per-fan cached mode-key case (F0Md vs F0md — varies by machine).
+    private var modeKeyCache: [Int: String] = [:]
+
+    /// Convenience init that returns nil if AppleSMC can't be opened
+    /// (e.g. running in a sandbox without the kext, headless CI, etc.).
+    public init?(helperClient: HelperClient = HelperClient()) {
+        self.helperClient = helperClient
+        // Catch struct-layout regressions before they corrupt SMC writes.
+        precondition(MemoryLayout<SMCParamStruct>.stride == 80,
+                     "SMCParamStruct layout is wrong (expected 80 bytes, got \(MemoryLayout<SMCParamStruct>.stride)).")
+        guard openSMC() else {
+            Log.smc.error("AppleSMC could not be opened — falling back to mock backend")
+            return nil
+        }
+        Log.smc.info("AppleSMC opened (connection=\(connection))")
+        discoverFans()
+        discoverSensors()
+        Log.smc.info("AppleSMC discovered \(fanIndices.count) fans, \(sensorKeys.count) temperature sensors")
+        primeSnapshot()
+    }
+
+    deinit {
+        if connection != 0 {
+            IOServiceClose(connection)
+        }
+    }
+
+    // MARK: SMCService
+
+    public func snapshot() -> (fans: [Fan], sensors: [TempSensor]) {
+        return (cachedFans, cachedSensors)
+    }
+
+    public func refresh() {
+        primeSnapshot()
+    }
+
+    @discardableResult
+    public func setMode(_ mode: FanMode, for fanID: String) -> Bool {
+        guard let idx = Int(fanID.dropFirst()) else {
+            Log.fans.error("setMode: invalid fanID '\(fanID)'")
+            return false
+        }
+        switch mode {
+        case .auto:
+            // Apple-Silicon-correct release: drop the Ftst unlock so
+            // thermalmonitord resumes its curve, then put Md back to 0.
+            let mKey = modeKey(forFan: idx)
+            if writeUInt8(key: "Ftst", value: 0) && writeUInt8(key: mKey, value: 0) {
+                Log.fans.info("Fan \(fanID) -> AUTO (direct, Ftst=0)")
+                updateCachedMode(for: fanID, to: .auto)
+                return true
+            }
+            if helperClient.setMode(.auto, for: fanID) {
+                Log.fans.info("Fan \(fanID) -> AUTO (via helper)")
+                updateCachedMode(for: fanID, to: .auto)
+                return true
+            }
+            Log.fans.error("Fan \(fanID) AUTO: direct + helper both failed")
+            return false
+        case .constant(let rpm):
+            if unlockFanControl(fanIdx: idx) && writeRPM(fanIdx: idx, rpm: rpm) {
+                Log.fans.info("Fan \(fanID) -> CONSTANT \(rpm) (direct)")
+                updateCachedMode(for: fanID, to: .constant(rpm: rpm), targetRPM: rpm)
+                return true
+            }
+            if helperClient.setMode(.constant(rpm: rpm), for: fanID) {
+                Log.fans.info("Fan \(fanID) -> CONSTANT \(rpm) (via helper)")
+                updateCachedMode(for: fanID, to: .constant(rpm: rpm), targetRPM: rpm)
+                return true
+            }
+            Log.fans.error("Fan \(fanID) CONSTANT \(rpm): direct + helper both failed")
+            return false
+        case .sensorBased:
+            updateCachedMode(for: fanID, to: mode)
+            Log.fans.info("Fan \(fanID) -> SENSOR-BASED (host-driven)")
+            return true
+        }
+    }
+
+    // MARK: - Apple Silicon fan-control dance
+
+    /// Apple Silicon firmware silently rejects `F0Md = 1` unless `Ftst`
+    /// is unlocked first. Sequence cribbed from exelban/stats SMC.swift.
+    private func unlockFanControl(fanIdx: Int) -> Bool {
+        let mKey = modeKey(forFan: fanIdx)
+        // Fast path: direct mode write (works on Intel + M5+).
+        if writeUInt8(key: mKey, value: 1) { return true }
+
+        // Slow path: read Ftst, write it to 1, wait, retry.
+        let alreadyUnlocked: Bool
+        if let v = readDouble("Ftst") {
+            alreadyUnlocked = v >= 1
+        } else {
+            // No Ftst key — give up; either firmware is locking us out
+            // some other way, or we're going through the helper anyway.
+            return false
+        }
+
+        if alreadyUnlocked {
+            for _ in 0..<20 {
+                if writeUInt8(key: mKey, value: 1) { return true }
+                usleep(50_000)
+            }
+            return false
+        }
+
+        var pushed = false
+        for _ in 0..<100 {
+            if writeUInt8(key: "Ftst", value: 1) { pushed = true; break }
+            usleep(50_000)
+        }
+        if !pushed { return false }
+
+        // Give thermalmonitord up to 3 s to yield control.
+        usleep(3_000_000)
+        for _ in 0..<300 {
+            if writeUInt8(key: mKey, value: 1) { return true }
+            usleep(100_000)
+        }
+        return false
+    }
+
+    /// Write a target RPM honoring the key's actual data type. On
+    /// Apple Silicon `F\(i)Tg` is `flt ` (4-byte IEEE 754); on Intel
+    /// it's `fpe2` (2-byte 14.2 fixed-point).
+    private func writeRPM(fanIdx: Int, rpm: Int) -> Bool {
+        let key = "F\(fanIdx)Tg"
+        var info = SMCParamStruct()
+        info.key = fourCC(key)
+        info.data8 = SMCCall.getKeyInfo.rawValue
+        guard let infoOut = call(input: info) else { return false }
+
+        var write = SMCParamStruct()
+        write.key = fourCC(key)
+        write.keyInfo = infoOut.keyInfo
+        write.data8 = SMCCall.writeKey.rawValue
+
+        let typeStr = fourCCString(infoOut.keyInfo.dataType)
+        switch typeStr {
+        case "fpe2":
+            let (hi, lo) = SMCDecoder.encodeFPE2(rpm)
+            write.bytes.0 = hi
+            write.bytes.1 = lo
+        case "flt ":
+            let f = Float(rpm)
+            let bits = f.bitPattern
+            // SMC stores flt little-endian — matches how we decode it.
+            write.bytes.0 = UInt8(bits & 0xFF)
+            write.bytes.1 = UInt8((bits >> 8) & 0xFF)
+            write.bytes.2 = UInt8((bits >> 16) & 0xFF)
+            write.bytes.3 = UInt8((bits >> 24) & 0xFF)
+        case "ui16":
+            let v = UInt16(max(0, min(Int(UInt16.max), rpm)))
+            write.bytes.0 = UInt8(v >> 8)
+            write.bytes.1 = UInt8(v & 0xFF)
+        default:
+            Log.smc.error("Unsupported \(key) type '\(typeStr)' — refusing to write")
+            return false
+        }
+
+        guard let writeOut = call(input: write) else { return false }
+        return writeOut.result == 0
+    }
+
+    /// Probes both `F\(i)Md` (uppercase) and `F\(i)md` (lowercase) and
+    /// caches whichever one the SMC answers. Different machines expose
+    /// different case.
+    private func modeKey(forFan idx: Int) -> String {
+        if let cached = modeKeyCache[idx] { return cached }
+        let upper = "F\(idx)Md"
+        let lower = "F\(idx)md"
+        if readDouble(upper) != nil { modeKeyCache[idx] = upper; return upper }
+        if readDouble(lower) != nil { modeKeyCache[idx] = lower; return lower }
+        modeKeyCache[idx] = upper
+        return upper
+    }
+
+    // MARK: - SMC primitives
+
+    private func openSMC() -> Bool {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault,
+                                                  IOServiceMatching("AppleSMC"))
+        guard service != 0 else { return false }
+        defer { IOObjectRelease(service) }
+        let kr = IOServiceOpen(service, mach_task_self_, 0, &connection)
+        return kr == KERN_SUCCESS
+    }
+
+    /// Look up data type + size for a key, then read the payload.
+    private func readKey(_ key: String) -> (type: UInt32, size: UInt32, bytes: SMCBytes32)? {
+        // Phase 1: getKeyInfo
+        var info = SMCParamStruct()
+        info.key = fourCC(key)
+        info.data8 = SMCCall.getKeyInfo.rawValue
+        guard let infoOut = call(input: info) else { return nil }
+        let size = infoOut.keyInfo.dataSize
+        let type = infoOut.keyInfo.dataType
+        guard size > 0 else { return nil }
+
+        // Phase 2: readKey
+        var read = SMCParamStruct()
+        read.key = fourCC(key)
+        read.keyInfo.dataSize = size
+        read.data8 = SMCCall.readKey.rawValue
+        guard let readOut = call(input: read) else { return nil }
+        if readOut.result != 0 {
+            Log.smc.debug("SMC read \(key) result=\(readOut.result)")
+            return nil
+        }
+        return (type, size, readOut.bytes)
+    }
+
+    /// Read a key and pull the numeric value as a Double — works for
+    /// fpe2 / sp78 / flt / ui* / si* tagged payloads.
+    private func readDouble(_ key: String) -> Double? {
+        guard let r = readKey(key) else { return nil }
+        return SMCDecoder.toDouble(type: r.type, size: r.size, bytes: r.bytes)
+    }
+
+    private func writeUInt8(key: String, value: UInt8) -> Bool {
+        // Get the existing key info first so the kernel accepts the write.
+        var info = SMCParamStruct()
+        info.key = fourCC(key)
+        info.data8 = SMCCall.getKeyInfo.rawValue
+        guard let infoOut = call(input: info) else { return false }
+        var write = SMCParamStruct()
+        write.key = fourCC(key)
+        write.keyInfo = infoOut.keyInfo
+        write.data8 = SMCCall.writeKey.rawValue
+        write.bytes.0 = value
+        guard let writeOut = call(input: write) else { return false }
+        return writeOut.result == 0
+    }
+
+    private func call(input: SMCParamStruct) -> SMCParamStruct? {
+        var input = input
+        var output = SMCParamStruct()
+        var outputSize = MemoryLayout<SMCParamStruct>.size
+        let inputSize = MemoryLayout<SMCParamStruct>.size
+        let kr = IOConnectCallStructMethod(
+            connection,
+            kSMCHandleYPCEvent,
+            &input, inputSize,
+            &output, &outputSize
+        )
+        guard kr == KERN_SUCCESS else {
+            Log.smc.debug("IOConnectCallStructMethod kr=\(kr)")
+            return nil
+        }
+        return output
+    }
+
+    // MARK: - Discovery
+
+    private func discoverFans() {
+        guard let n = readDouble("FNum") else {
+            fanIndices = []
+            return
+        }
+        fanIndices = (0..<Int(n)).map { $0 }
+    }
+
+    /// Known SMC keys that resolve on Apple Silicon Macs (M1/M2/M3/M4)
+    /// plus a few Intel-era keys for backward compatibility. We probe each
+    /// at discovery time and only keep the ones the chip actually answers.
+    private static let candidateSensors: [(String, String, SensorKind)] = [
+        // CPU
+        ("TC0E", "CPU Die Temperature", .cpu),
+        ("TC0F", "CPU Die Filtered", .cpu),
+        ("TC0P", "CPU Proximity", .cpu),
+        ("TC0H", "CPU Heatpipe", .cpu),
+        ("TC1C", "CPU Core 1", .cpu),
+        ("TC2C", "CPU Core 2", .cpu),
+        ("TC3C", "CPU Core 3", .cpu),
+        ("TC4C", "CPU Core 4", .cpu),
+        ("Tp09", "CPU Performance Core 1", .cpu),
+        ("Tp0T", "CPU Performance Core 2", .cpu),
+        ("Tp0b", "CPU Performance Core 3", .cpu),
+        ("Tp0d", "CPU Performance Core 4", .cpu),
+        ("Tp0f", "CPU Efficiency Core 1", .cpu),
+        ("Tp0n", "CPU Efficiency Core 2", .cpu),
+        // GPU
+        ("TG0D", "GPU Die", .gpu),
+        ("TG0P", "GPU Proximity", .gpu),
+        ("TG0H", "GPU Heatpipe", .gpu),
+        ("Tg0D", "GPU Cluster 1", .gpu),
+        ("Tg0V", "GPU Cluster 2", .gpu),
+        // Battery
+        ("TB0T", "Battery", .battery),
+        ("TB1T", "Battery Cell 1", .battery),
+        ("TB2T", "Battery Cell 2", .battery),
+        // Storage
+        ("TH0a", "NVMe SSD", .storage),
+        ("TH0b", "NVMe SSD Drive", .storage),
+        ("TH0x", "SSD Hottest", .storage),
+        // Airport / Thunderbolt / Misc proximities
+        ("TW0P", "Airport Proximity", .airport),
+        ("TTLD", "Thunderbolt Left", .thunderbolt),
+        ("TTRD", "Thunderbolt Right", .thunderbolt),
+        ("TPCD", "Platform Controller", .proximity),
+        ("Ts0S", "Palm Rest", .proximity),
+        // Power
+        ("TPDA", "Power Manager Die Avg", .power),
+        ("TPSP", "Power Supply Proximity", .power),
+        // Trackpad
+        ("TTPD", "Trackpad", .trackpad),
+    ]
+
+    private func discoverSensors() {
+        var found: [(String, String, SensorKind)] = []
+        for (key, name, kind) in Self.candidateSensors {
+            if readDouble(key) != nil {
+                found.append((key, name, kind))
+            }
+        }
+        sensorKeys = found
+    }
+
+    // MARK: - Snapshot
+
+    private func primeSnapshot() {
+        // Fans
+        var newFans: [Fan] = []
+        for i in fanIndices {
+            let actual = readDouble("F\(i)Ac") ?? 0
+            let minR   = readDouble("F\(i)Mn") ?? 0
+            let maxR   = readDouble("F\(i)Mx") ?? max(actual, 6000)
+            let target = readDouble("F\(i)Tg") ?? actual
+            let md     = readDouble(modeKey(forFan: i)) ?? 0
+
+            let existing = cachedFans.first(where: { $0.id == "F\(i)" })
+            let baseMode: FanMode
+            if md >= 1 {
+                baseMode = .constant(rpm: Int(target))
+            } else {
+                baseMode = .auto
+            }
+            // Preserve a sensor-based mode the host is driving even though
+            // the SMC itself doesn't expose that state.
+            let mode: FanMode
+            if case .sensorBased = existing?.mode {
+                mode = existing!.mode
+            } else {
+                mode = baseMode
+            }
+
+            newFans.append(Fan(
+                id: "F\(i)",
+                name: fanName(for: i),
+                minRPM: Int(minR),
+                maxRPM: Int(maxR),
+                currentRPM: Int(actual),
+                targetRPM: Int(target),
+                mode: mode
+            ))
+        }
+
+        // Sensors
+        var newSensors: [TempSensor] = []
+        for (key, name, kind) in sensorKeys {
+            guard let c = readDouble(key) else { continue }
+            // Out-of-band readings (sensor not populated) — skip
+            guard c > -20, c < 130 else { continue }
+            newSensors.append(TempSensor(id: key, name: name, kind: kind, celsius: c))
+        }
+
+        cachedFans = newFans
+        cachedSensors = newSensors
+
+        // Host-side sensor-based mode → push the right target this tick.
+        for fan in cachedFans {
+            if case .sensorBased(let sid, let lo, let hi) = fan.mode,
+               let s = newSensors.first(where: { $0.id == sid }) {
+                let target = rpmForTemp(s.celsius, fan: fan, low: lo, high: hi)
+                if let fanIdx = Int(fan.id.dropFirst()) {
+                    _ = writeRPM(fanIdx: fanIdx, rpm: target)
+                }
+            }
+        }
+    }
+
+    private func fanName(for index: Int) -> String {
+        switch index {
+        case 0: return "Left side"
+        case 1: return "Right side"
+        case 2: return "Fan 3"
+        case 3: return "Fan 4"
+        default: return "Fan \(index + 1)"
+        }
+    }
+
+    private func rpmForTemp(_ c: Double, fan: Fan, low: Double, high: Double) -> Int {
+        guard high > low else { return fan.minRPM }
+        let t = max(0, min(1, (c - low) / (high - low)))
+        return fan.minRPM + Int(t * Double(fan.maxRPM - fan.minRPM))
+    }
+
+    // MARK: - In-memory mode bookkeeping
+
+    private func updateCachedMode(for fanID: String, to mode: FanMode, targetRPM: Int? = nil) {
+        guard let i = cachedFans.firstIndex(where: { $0.id == fanID }) else { return }
+        cachedFans[i].mode = mode
+        if let t = targetRPM { cachedFans[i].targetRPM = t }
+    }
+}

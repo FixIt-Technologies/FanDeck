@@ -1,0 +1,168 @@
+//
+//  AppState.swift
+//  GenesisFanControlCore
+//
+//  Polls the SMC service and republishes fans + sensors for the UI.
+//  All SMC I/O (reads + writes) runs on a dedicated serial queue so a
+//  slow operation — notably the Apple Silicon `Ftst` unlock dance, which
+//  sleeps for ~3 s — can't freeze the SwiftUI main thread.
+//
+
+import Foundation
+import Combine
+
+@MainActor
+public final class AppState: ObservableObject {
+    public static let shared = AppState()
+
+    @Published public private(set) var fans: [Fan] = []
+    @Published public private(set) var sensors: [TempSensor] = []
+    @Published public private(set) var lastUpdated: Date = .distantPast
+    /// Set to true the first time a fan write is rejected by the SMC —
+    /// almost always means "needs root". The UI surfaces a banner.
+    @Published public var needsElevation: Bool = false
+    /// True when the privileged helper is installed and answering pings.
+    @Published public private(set) var helperAvailable: Bool = false
+    /// While `installHelper()` is running so the UI can show a spinner.
+    @Published public private(set) var helperInstalling: Bool = false
+    @Published public var helperInstallError: String?
+    /// True while at least one SMC write is in flight — UI can show a
+    /// spinner / disable controls if it wants.
+    @Published public private(set) var writeInFlight: Bool = false
+
+    public nonisolated let helperClient = HelperClient()
+    public nonisolated let smc: SMCService
+
+    /// Serializes ALL access to `smc`. The Timer-driven tick(), the user's
+    /// drag-driven setMode(), and the helper install completion handler all
+    /// funnel through this queue so the underlying SMCService never sees
+    /// concurrent calls.
+    private nonisolated let smcQueue = DispatchQueue(
+        label: "dev.foltyn.genesis-fan-control.smc",
+        qos: .userInitiated
+    )
+
+    private var timer: Timer?
+
+    public init(smc: SMCService? = nil, autoStartPolling: Bool = true) {
+        let resolved: SMCService = smc ?? AppleSMCService() ?? MockSMCService()
+        self.smc = resolved
+        Log.lifecycle.info("AppState init — backend=\(resolved.backendName) simulated=\(resolved.isSimulated)")
+        let snap = resolved.snapshot()
+        self.fans = snap.fans
+        self.sensors = snap.sensors
+        if autoStartPolling { startPolling() }
+    }
+
+    public func startPolling() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        Log.lifecycle.debug("Polling timer started (1s interval)")
+    }
+
+    public func stopPolling() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    /// Refresh from SMC. Dispatches the slow read pass to the SMC queue
+    /// and republishes on the main actor. Safe to call from main.
+    public func tick() {
+        let smc = self.smc
+        let helperClient = self.helperClient
+        smcQueue.async { [weak self] in
+            smc.refresh()
+            let snap = smc.snapshot()
+            let isUp = helperClient.ping()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.fans = snap.fans
+                self.sensors = snap.sensors
+                self.lastUpdated = Date()
+                if isUp != self.helperAvailable { self.helperAvailable = isUp }
+                if isUp { self.needsElevation = false }
+            }
+        }
+    }
+
+    public func installHelper() {
+        helperInstalling = true
+        helperInstallError = nil
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                try HelperInstaller.install()
+                await MainActor.run { [weak self] in
+                    self?.helperInstalling = false
+                    self?.helperAvailable = true
+                    self?.needsElevation = false
+                }
+            } catch {
+                let msg = "\(error)"
+                await MainActor.run { [weak self] in
+                    self?.helperInstalling = false
+                    self?.helperInstallError = msg
+                }
+            }
+        }
+    }
+
+    // MARK: - Public mutators
+
+    /// Apply a new fan mode. Returns immediately. The UI is updated
+    /// optimistically so the gauge reflects the user's intent right away;
+    /// the actual SMC write happens on `smcQueue` (where the M-series
+    /// `Ftst` dance is free to sleep for several seconds without freezing
+    /// the cursor). When the write resolves we refresh the snapshot — if
+    /// the kernel rejected the write, the optimistic state is overwritten
+    /// with reality and the elevation banner is raised.
+    public func setMode(_ mode: FanMode, for fanID: String) {
+        applyOptimisticMode(mode, for: fanID)
+        writeInFlight = true
+
+        let smc = self.smc
+        smcQueue.async { [weak self] in
+            let ok = smc.setMode(mode, for: fanID)
+            smc.refresh()
+            let snap = smc.snapshot()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if !ok { self.needsElevation = true }
+                self.fans = snap.fans
+                self.sensors = snap.sensors
+                self.lastUpdated = Date()
+                self.writeInFlight = false
+            }
+        }
+    }
+
+    /// Push the requested mode into the published state immediately so the
+    /// gauge tracks the user's drag even while the SMC write is still in
+    /// flight. The next post-write snapshot will overwrite this with the
+    /// real SMC state.
+    private func applyOptimisticMode(_ mode: FanMode, for fanID: String) {
+        guard let i = fans.firstIndex(where: { $0.id == fanID }) else { return }
+        switch mode {
+        case .auto:
+            fans[i].mode = .auto
+        case .constant(let rpm):
+            let clamped = max(fans[i].minRPM, min(fans[i].maxRPM, rpm))
+            fans[i].mode = .constant(rpm: clamped)
+            fans[i].targetRPM = clamped
+            fans[i].currentRPM = clamped
+        case .sensorBased:
+            fans[i].mode = mode
+        }
+    }
+
+    // MARK: - Convenience lookups
+
+    public func fan(withID id: String) -> Fan? { fans.first { $0.id == id } }
+    public func sensor(withID id: String) -> TempSensor? { sensors.first { $0.id == id } }
+
+    public var headlineSensor: TempSensor? {
+        sensors.filter { $0.kind == .cpu }.max(by: { $0.celsius < $1.celsius })
+            ?? sensors.first
+    }
+}
