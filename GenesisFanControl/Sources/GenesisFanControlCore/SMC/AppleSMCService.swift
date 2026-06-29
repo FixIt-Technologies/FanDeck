@@ -195,11 +195,17 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         }
         switch mode {
         case .auto:
-            // Apple-Silicon-correct release: drop the Ftst unlock so
-            // thermalmonitord resumes its curve, then put Md back to 0.
+            // Apple-Silicon-correct release: F0Md MUST be set back to 0
+            // BEFORE Ftst is dropped. The firmware re-locks the moment
+            // Ftst goes 1→0, and any subsequent F0Md write while the
+            // lock is back silently fails — leaving the fan stuck in
+            // CONSTANT despite us thinking we released. Symptom: user
+            // clicks "Auto", UI optimistically flips to auto, helper
+            // returns false, AppState reverts UI to the previous
+            // constant ("blink and back to old setting").
             let mKey = modeKey(forFan: idx)
-            if writeUInt8(key: "Ftst", value: 0) && writeUInt8(key: mKey, value: 0) {
-                Log.fans.info("Fan \(fanID) -> AUTO (direct, Ftst=0)")
+            if writeUInt8(key: mKey, value: 0) && writeUInt8(key: "Ftst", value: 0) {
+                Log.fans.info("Fan \(fanID) -> AUTO (direct, F0Md=0 then Ftst=0)")
                 updateCachedMode(for: fanID, to: .auto)
                 return true
             }

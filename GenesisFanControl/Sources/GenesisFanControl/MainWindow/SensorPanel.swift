@@ -63,25 +63,15 @@ struct SensorPanel: View {
                 .foregroundColor(.gfcTextMuted)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-            // 24pt tap area on top of the 13pt glyph — the original
-            // 12pt-only contentShape was too small to hit reliably in
-            // the title-bar header. SwiftUI Button's underlying NSButton
-            // already returns false from `mouseDownCanMoveWindow`, so
-            // we don't need an NSViewRepresentable wrapper (an earlier
-            // attempt at one — NoDragArea — threw an autolayout
-            // exception during a later constraint-update pass and
-            // aborted the process, deleted in this commit).
-            Button {
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-            } label: {
-                Image(systemName: "gearshape.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.gfcTextSecondary)
-                    .frame(width: 24, height: 24)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Open Settings (⌘,)")
+            // Bare NSApp.sendAction("showSettingsWindow:") was returning
+            // false on macOS 26 — the responder chain lookup wasn't
+            // landing on the Settings scene's installed handler. The
+            // GearButton wrapper activates the app first, then tries
+            // the modern selector, the legacy "showPreferencesWindow:"
+            // selector, and finally walks the application menu for any
+            // item whose title contains "Settings" or "Preferences" —
+            // one of those always fires.
+            GearButton()
         }
         .padding(.horizontal, 12)
         // Same height as the topStatusBar — TEMPERATURES sits on the
@@ -286,5 +276,60 @@ private extension SensorKind {
         case .trackpad: return "Trackpad"
         case .other: return "Other"
         }
+    }
+}
+
+// MARK: - Settings gear button
+
+/// Reliably opens the Settings scene from a header button. NSApp.sendAction
+/// with bare selectors returned false on macOS 26; this falls back through
+/// modern selector → legacy selector → Application menu walk.
+private struct GearButton: View {
+    var body: some View {
+        Button {
+            openSettingsRobustly()
+        } label: {
+            Image(systemName: "gearshape.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.gfcTextSecondary)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Open Settings (⌘,)")
+    }
+
+    private func openSettingsRobustly() {
+        // Settings scene refuses to come forward unless we activate first
+        // in .accessory mode.
+        NSApp.activate(ignoringOtherApps: true)
+
+        // 1) Modern selector (macOS 13+).
+        if NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+            Log.ui.debug("Settings opened via showSettingsWindow:")
+            return
+        }
+        // 2) Legacy selector (macOS ≤ 12 / fallback name).
+        if NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil) {
+            Log.ui.debug("Settings opened via showPreferencesWindow:")
+            return
+        }
+        // 3) Walk the main Application menu for an item whose title looks
+        //    like Settings / Preferences and invoke its action explicitly.
+        if let mainMenu = NSApp.mainMenu {
+            for menuItem in mainMenu.items {
+                guard let submenu = menuItem.submenu else { continue }
+                for sub in submenu.items where
+                    sub.title.localizedCaseInsensitiveContains("settings") ||
+                    sub.title.localizedCaseInsensitiveContains("preferences") {
+                    if let action = sub.action {
+                        let ok = NSApp.sendAction(action, to: sub.target, from: nil)
+                        Log.ui.debug("Settings opened via menu walk '\(sub.title)' → \(ok)")
+                        if ok { return }
+                    }
+                }
+            }
+        }
+        Log.ui.error("Settings: all selector + menu-walk fallbacks failed")
     }
 }
