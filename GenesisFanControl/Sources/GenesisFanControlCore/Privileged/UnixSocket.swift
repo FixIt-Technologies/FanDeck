@@ -54,12 +54,22 @@ public enum UnixSocket {
         return fd
     }
 
-    /// Bind + listen — caller invokes accept() in a loop.
-    public static func listen(atPath path: String, backlog: Int32 = 8) throws -> Int32 {
+    /// Bind + listen — caller invokes accept() in a loop. Socket is
+    /// owned `root:admin` with perms `0660`, so only members of `admin`
+    /// (i.e. local admin users — what `sudo` already grants) can open it.
+    /// Belt-and-braces for the per-accept `getpeereid` cred-check in the
+    /// helper; this just makes the socket unreachable to nobody/_apache/
+    /// other system daemons. Caller-tweakable for tests via `mode`.
+    public static func listen(atPath path: String, backlog: Int32 = 8,
+                              mode: mode_t = 0o660) throws -> Int32 {
         unlink(path)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw UnixSocketError.socketCreate(errno: errno) }
         var addr = try makeAddr(path: path)
+        // Mask any in-process umask so the chmod below is honored even
+        // when launchd inherits e.g. 0022 from the system default.
+        let oldMask = umask(0o077)
+        defer { umask(oldMask) }
         let bindRC = withUnsafePointer(to: &addr) { p -> Int32 in
             p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 Darwin.bind(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
@@ -70,14 +80,41 @@ public enum UnixSocket {
             close(fd)
             throw UnixSocketError.bind(errno: e)
         }
-        // World-writable so any GUI session on this Mac can use it.
-        chmod(path, 0o666)
+        // root:admin 0660. Failures here are non-fatal — log via stderr
+        // so the helper still answers; cred-check in accept loop is the
+        // actual security gate.
+        let pw = getgrnam("admin")
+        let adminGID: gid_t = pw?.pointee.gr_gid ?? 80   // 80 == admin on macOS
+        chown(path, 0, adminGID)
+        chmod(path, mode)
         if Darwin.listen(fd, backlog) < 0 {
             let e = errno
             close(fd)
             throw UnixSocketError.listen(errno: e)
         }
         return fd
+    }
+
+    /// `getpeereid(2)` — returns the effective UID/GID of the process on
+    /// the OTHER end of `fd`. Returns nil if the call fails (rare for
+    /// AF_UNIX). The helper uses this to reject connections from
+    /// arbitrary local UIDs even though the socket path is reachable.
+    public static func peerEUID(_ fd: Int32) -> (uid: uid_t, gid: gid_t)? {
+        var euid: uid_t = 0
+        var egid: gid_t = 0
+        let rc = getpeereid(fd, &euid, &egid)
+        return rc == 0 ? (euid, egid) : nil
+    }
+
+    /// Set send + receive timeouts on `fd`. Used by both sides so a slow
+    /// or dead peer can't pin the helper or the GUI indefinitely (the
+    /// Apple Silicon Ftst unlock dance can legitimately take ~3s; we
+    /// give the call 5s of headroom and fail fast after that).
+    public static func setTimeouts(_ fd: Int32, seconds: Int = 5) {
+        var tv = timeval(tv_sec: __darwin_time_t(seconds), tv_usec: 0)
+        let size = socklen_t(MemoryLayout<timeval>.size)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, size)
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, size)
     }
 
     /// Write the bytes followed by '\n'. JSON has no inner newlines so a

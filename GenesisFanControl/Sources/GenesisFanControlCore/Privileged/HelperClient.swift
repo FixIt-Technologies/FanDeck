@@ -85,6 +85,11 @@ public final class HelperClient: @unchecked Sendable {
     private func send(_ req: HelperRequest) throws -> HelperResponse {
         let fd = try UnixSocket.connect(toPath: socketPath)
         defer { close(fd) }
+        // 5s SO_RCVTIMEO/SO_SNDTIMEO. A slow Ftst dance inside the
+        // helper can legitimately take ~3s; this gives 2s headroom and
+        // fails fast on a deadlocked / hung helper instead of pinning
+        // the GUI's smcQueue forever (review MED — "no socket timeouts").
+        UnixSocket.setTimeouts(fd, seconds: 5)
         let payload = try encoder.encode(req)
         try UnixSocket.writeLine(fd, payload: payload)
         let raw = try UnixSocket.readLine(fd)

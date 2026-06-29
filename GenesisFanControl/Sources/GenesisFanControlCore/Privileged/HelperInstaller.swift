@@ -57,6 +57,20 @@ public enum HelperInstaller {
     public static func install() throws {
         let helperBinary = try locateHelperBinary()
 
+        // Escape every interpolated path the way bash single-quote-bracketed
+        // strings expect: `'` → `'\''`. Without this, a username/dev path
+        // containing an apostrophe (Genesis' Projects / O'Brien / Martin's
+        // MacBook) breaks out of the string and either fails the script or,
+        // worse, runs whatever follows as a shell command.
+        let helperQ      = shellEscape(helperBinary)
+        let installedQ   = shellEscape(HelperConstants.installedHelperPath)
+        let launchdQ     = shellEscape(HelperConstants.launchDaemonPath)
+        let labelLiteral = HelperConstants.helperLabel
+            // Label is project-controlled (defined as a Swift string
+            // literal) but defend in depth — strip anything that could
+            // be interpreted by the shell.
+            .replacingOccurrences(of: "'", with: "'\\''")
+
         // The shell script copies, writes the plist, loads it via launchctl.
         let plistXML = launchdPlistContents()
         let script = """
@@ -68,18 +82,18 @@ public enum HelperInstaller {
         rm -f /usr/local/sbin/macsfancontrol-helper
         rm -f /var/run/macsfancontrol.sock
         mkdir -p /usr/local/sbin
-        cp '\(helperBinary)' '\(HelperConstants.installedHelperPath)'
-        chown root:wheel '\(HelperConstants.installedHelperPath)'
-        chmod 755 '\(HelperConstants.installedHelperPath)'
-        cat > '\(HelperConstants.launchDaemonPath)' << 'PLIST_EOF'
+        cp \(helperQ) \(installedQ)
+        chown root:wheel \(installedQ)
+        chmod 755 \(installedQ)
+        cat > \(launchdQ) << 'PLIST_EOF'
         \(plistXML)
         PLIST_EOF
-        chown root:wheel '\(HelperConstants.launchDaemonPath)'
-        chmod 644 '\(HelperConstants.launchDaemonPath)'
-        launchctl bootout system '\(HelperConstants.launchDaemonPath)' 2>/dev/null || true
-        launchctl bootstrap system '\(HelperConstants.launchDaemonPath)'
-        launchctl enable system/\(HelperConstants.helperLabel) 2>/dev/null || true
-        launchctl kickstart -k system/\(HelperConstants.helperLabel)
+        chown root:wheel \(launchdQ)
+        chmod 644 \(launchdQ)
+        launchctl bootout system \(launchdQ) 2>/dev/null || true
+        launchctl bootstrap system \(launchdQ)
+        launchctl enable system/\(labelLiteral) 2>/dev/null || true
+        launchctl kickstart -k system/\(labelLiteral)
         """
 
         try runWithAdminPrivileges(script: script)
@@ -97,13 +111,23 @@ public enum HelperInstaller {
     /// Uninstall via the same admin prompt. Used by a "Remove" button (or
     /// from the CLI for cleanup during development).
     public static func uninstall() throws {
+        let launchdQ   = shellEscape(HelperConstants.launchDaemonPath)
+        let installedQ = shellEscape(HelperConstants.installedHelperPath)
+        let socketQ    = shellEscape(HelperConstants.socketPath)
         let script = """
-        launchctl bootout system '\(HelperConstants.launchDaemonPath)' 2>/dev/null || true
-        rm -f '\(HelperConstants.launchDaemonPath)'
-        rm -f '\(HelperConstants.installedHelperPath)'
-        rm -f '\(HelperConstants.socketPath)'
+        launchctl bootout system \(launchdQ) 2>/dev/null || true
+        rm -f \(launchdQ)
+        rm -f \(installedQ)
+        rm -f \(socketQ)
         """
         try runWithAdminPrivileges(script: script)
+    }
+
+    /// Wrap `s` in single quotes, escaping any embedded `'` as `'\''`.
+    /// Result is safe to drop verbatim into a single-quoted bash word.
+    /// Example: `it's` → `'it'\''s'`.
+    private static func shellEscape(_ s: String) -> String {
+        return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     // MARK: -

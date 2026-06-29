@@ -147,9 +147,9 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
     private var cachedFans: [Fan] = []
     private var cachedSensors: [TempSensor] = []
     /// Routes writes through the privileged helper when direct SMC writes
-    /// hit `kIOReturnNotPrivileged`. Set on construction; can be probed
-    /// lazily later when the helper is installed.
-    private let helperClient: HelperClient
+    /// hit `kIOReturnNotPrivileged`. nil inside the helper process itself
+    /// (we ARE the helper — connecting to our own socket would deadlock).
+    private let helperClient: HelperClient?
     /// Per-fan cached mode-key case (F0Md vs F0md — varies by machine).
     private var modeKeyCache: [Int: String] = [:]
 
@@ -161,7 +161,10 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
     /// thermalmonitord left F0Tg at whatever it last clamped, and a
     /// fresh init would otherwise adopt that value as "user intent"
     /// and re-assert it forever. Opt-out path exists for tests.
-    public init?(helperClient: HelperClient = HelperClient(),
+    /// `helperClient = nil` is the helper-process knob — without it
+    /// the helper's own AppleSMCService would recursively connect to
+    /// itself on every fallback path.
+    public init?(helperClient: HelperClient? = HelperClient(),
                  forceSafeReset: Bool = true) {
         self.helperClient = helperClient
         // Catch struct-layout regressions before they corrupt SMC writes.
@@ -231,13 +234,12 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             // clicks "Auto", UI optimistically flips to auto, helper
             // returns false, AppState reverts UI to the previous
             // constant ("blink and back to old setting").
-            let mKey = modeKey(forFan: idx)
-            if writeUInt8(key: mKey, value: 0) && writeUInt8(key: "Ftst", value: 0) {
-                Log.fans.info("Fan \(fanID) -> AUTO (direct, F0Md=0 then Ftst=0)")
+            if autoReleaseDirect(fanIdx: idx) {
+                Log.fans.info("Fan \(fanID) -> AUTO (direct, F0Md=0 then Ftst=0 if last)")
                 updateCachedMode(for: fanID, to: .auto)
                 return true
             }
-            if helperClient.setMode(.auto, for: fanID) {
+            if let helper = helperClient, helper.setMode(.auto, for: fanID) {
                 Log.fans.info("Fan \(fanID) -> AUTO (via helper)")
                 updateCachedMode(for: fanID, to: .auto)
                 return true
@@ -250,7 +252,7 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
                 updateCachedMode(for: fanID, to: .constant(rpm: rpm), targetRPM: rpm)
                 return true
             }
-            if helperClient.setMode(.constant(rpm: rpm), for: fanID) {
+            if let helper = helperClient, helper.setMode(.constant(rpm: rpm), for: fanID) {
                 Log.fans.info("Fan \(fanID) -> CONSTANT \(rpm) (via helper)")
                 updateCachedMode(for: fanID, to: .constant(rpm: rpm), targetRPM: rpm)
                 return true
@@ -269,8 +271,9 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
                 Log.fans.info("Fan \(fanID) -> SENSOR-BASED (host-driven, unlocked direct)")
                 return true
             }
-            if helperClient.setMode(.constant(rpm: cachedFans.first(where: { $0.id == fanID })?.targetRPM ?? minSafeRPM(forFan: idx)),
-                                    for: fanID) {
+            if let helper = helperClient,
+               helper.setMode(.constant(rpm: cachedFans.first(where: { $0.id == fanID })?.targetRPM ?? minSafeRPM(forFan: idx)),
+                              for: fanID) {
                 // Helper successfully put us in constant. Switch cached
                 // mode to sensorBased (host loop will drive target).
                 updateCachedMode(for: fanID, to: mode)
@@ -280,6 +283,36 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             Log.fans.error("Fan \(fanID) SENSOR-BASED: failed to unlock fan control (direct + helper)")
             return false
         }
+    }
+
+    /// AUTO release with the "Ftst is global" invariant respected.
+    /// Writes `F\(i)Md = 0` always; only drops `Ftst = 0` when EVERY
+    /// other fan is also back in auto. Otherwise Fan0 going auto would
+    /// silently re-lock the firmware for Fan1's still-constant setpoint,
+    /// and Fan1 would gradually drift away from what the user pinned
+    /// (review MED — "Ftst is global, treated as per-fan").
+    private func autoReleaseDirect(fanIdx: Int) -> Bool {
+        let mKey = modeKey(forFan: fanIdx)
+        guard writeUInt8(key: mKey, value: 0) else { return false }
+        let othersStillConstant = cachedFans.contains { other in
+            guard let oi = Int(other.id.dropFirst()), oi != fanIdx else { return false }
+            switch other.mode {
+            case .auto: return false
+            case .constant, .sensorBased: return true
+            }
+        }
+        if othersStillConstant {
+            Log.fans.debug("Fan \(fanIdx) AUTO: keeping Ftst=1 — other fans still non-auto")
+            return true
+        }
+        // Last non-auto fan going home — safe to lower the global lock.
+        if !writeUInt8(key: "Ftst", value: 0) {
+            // Direct Ftst write may legitimately fail (firmware bounce) —
+            // F0Md=0 is the load-bearing write; Ftst will naturally
+            // drift back to 0 on next firmware re-arm. Not fatal.
+            Log.fans.debug("Fan \(fanIdx) AUTO: F0Md=0 ok but Ftst=0 was refused")
+        }
+        return true
     }
 
     /// Floor used when we have to ask the helper to enter constant mode
@@ -668,7 +701,7 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             // socket round-trip + unlock-already-succeeded fast path; the
             // cost is in the order of a millisecond per fan per tick.
             if !writeRPM(fanIdx: fanIdx, rpm: rpm) {
-                _ = helperClient.setMode(.constant(rpm: rpm), for: fan.id)
+                _ = helperClient?.setMode(.constant(rpm: rpm), for: fan.id)
             }
         }
     }

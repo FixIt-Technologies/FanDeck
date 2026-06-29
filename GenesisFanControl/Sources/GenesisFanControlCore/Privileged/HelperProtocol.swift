@@ -23,7 +23,11 @@ public enum HelperConstants {
     /// the installed helper returns, HelperClient.health() reports
     /// `.outdated` and the GUI raises the elevation banner so the user
     /// can re-install. Bump on every helper-side fix.
-    public static let protocolVersion = 2
+    ///
+    /// v3 (2026-06-30): cred-check on accept, 0660 socket, locked-fan
+    /// tracking + SIGTERM revert, idle watchdog. Old v2 helper has no
+    /// safety net for a crashed GUI; everyone should upgrade.
+    public static let protocolVersion = 3
 }
 
 public enum HelperRequest: Codable {
