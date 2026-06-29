@@ -129,11 +129,14 @@ struct DraggableRPMGauge: View {
                     .animation(isDragging ? nil : .easeOut(duration: 1.0),
                                value: displayedFraction)
 
-                // Manual setpoint wall (during drag OR while fan is in constant mode)
-                if let target = activeManualRPM() {
-                    let x = positionFor(rpm: target, totalWidth: geo.size.width)
-                    ManualWall(x: x, totalWidth: geo.size.width, height: height,
-                               rpm: target, isDragging: isDragging)
+                // Setpoint wall — amber for manual constant, cyan for the
+                // live sensor-based target. Always shows the RPM label so
+                // the user can read exactly where the fan is being pinned.
+                if let marker = activeMarker() {
+                    let x = positionFor(rpm: marker.rpm, totalWidth: geo.size.width)
+                    SetpointWall(x: x, totalWidth: geo.size.width, height: height,
+                                 rpm: marker.rpm, color: marker.color, label: marker.label,
+                                 emphasised: isDragging)
                 }
             }
             .frame(height: height)
@@ -161,7 +164,8 @@ struct DraggableRPMGauge: View {
             )
             .help(helpText)
         }
-        .frame(height: height + 6)
+        // Frame leaves room for the RPM tag rendered BELOW the wall.
+        .frame(height: height + 24)
     }
 
     // MARK: helpers
@@ -173,6 +177,29 @@ struct DraggableRPMGauge: View {
     private func activeManualRPM() -> Int? {
         if let dragRPM { return dragRPM }
         if case .constant(let rpm) = fan.mode { return rpm }
+        return nil
+    }
+
+    /// One marker describes the wall: where it is on the bar, what RPM
+    /// it represents, what color, and the text under it. Manual (drag or
+    /// constant) is amber; the sensor-based dynamic target is cyan.
+    private struct Marker {
+        let rpm: Int
+        let color: Color
+        let label: String
+    }
+
+    private func activeMarker() -> Marker? {
+        if let dragRPM {
+            return Marker(rpm: dragRPM, color: .gfcAmber, label: "\(dragRPM) RPM")
+        }
+        if case .constant(let rpm) = fan.mode {
+            return Marker(rpm: rpm, color: .gfcAmber, label: "\(rpm) RPM")
+        }
+        if case .sensorBased = fan.mode {
+            return Marker(rpm: fan.targetRPM, color: .gfcCyan,
+                          label: "→ \(fan.targetRPM) RPM")
+        }
         return nil
     }
 
@@ -199,14 +226,16 @@ struct DraggableRPMGauge: View {
     }
 }
 
-// MARK: - Manual wall marker
+// MARK: - Setpoint wall marker
 
-private struct ManualWall: View {
+private struct SetpointWall: View {
     let x: CGFloat
     let totalWidth: CGFloat
     let height: CGFloat
     let rpm: Int
-    let isDragging: Bool
+    let color: Color
+    let label: String
+    let emphasised: Bool
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -214,32 +243,34 @@ private struct ManualWall: View {
             Rectangle()
                 .fill(
                     LinearGradient(
-                        colors: [Color.gfcAmber.opacity(0.85), Color.gfcAmber],
+                        colors: [color.opacity(0.85), color],
                         startPoint: .top,
                         endPoint: .bottom
                     )
                 )
-                .frame(width: isDragging ? 4 : 3, height: height + 8)
-                .shadow(color: .gfcAmber.opacity(0.85), radius: isDragging ? 8 : 5)
-                .offset(x: x - (isDragging ? 2 : 1.5), y: -4)
-                .animation(.easeOut(duration: 0.1), value: isDragging)
+                .frame(width: emphasised ? 4 : 3, height: height + 8)
+                .shadow(color: color.opacity(0.85), radius: emphasised ? 8 : 5)
+                .offset(x: x - (emphasised ? 2 : 1.5), y: -4)
+                .animation(.easeOut(duration: 0.1), value: emphasised)
 
-            // Floating RPM tag (only while dragging — keeps the gauge calm at rest)
-            if isDragging {
-                Text("\(rpm)")
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(Color.gfcAmber)
-                    )
-                    .shadow(color: .gfcAmber.opacity(0.6), radius: 4)
-                    .offset(x: clamp(x - 18, lower: 0, upper: max(0, totalWidth - 36)),
-                            y: -22)
-                    .transition(.opacity)
-            }
+            // RPM tag — always visible below the wall so the user sees the
+            // exact trigger value. Width estimated from char count so we
+            // can keep it inside the gauge.
+            let estimatedWidth: CGFloat = CGFloat(label.count) * 6 + 12
+            Text(label)
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundColor(.black)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(color)
+                )
+                .shadow(color: color.opacity(0.5), radius: 3)
+                .offset(x: clamp(x - estimatedWidth / 2,
+                                 lower: 0,
+                                 upper: max(0, totalWidth - estimatedWidth)),
+                        y: height + 4)
         }
     }
 

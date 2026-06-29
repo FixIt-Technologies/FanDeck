@@ -172,14 +172,23 @@ struct FanControlSheet: View {
                         .foregroundColor(.gfcText)
                     Picker("", selection: $sensorID) {
                         ForEach(appState.sensors) { s in
-                            HStack {
+                            // Trailing temp is right-padded inside the label
+                            // string itself because macOS Pickers (menu style)
+                            // don't honor Spacer() across menu items.
+                            let temp = s.formatted(useFahrenheit: settings.useFahrenheit, precise: false)
+                            HStack(spacing: 8) {
                                 Image(systemName: s.kind.sfSymbol)
                                 Text(s.name)
-                            }.tag(s.id)
+                                Spacer(minLength: 12)
+                                Text(temp)
+                                    .monospacedDigit()
+                                    .foregroundColor(.secondary)
+                            }
+                            .tag(s.id)
                         }
                     }
                     .labelsHidden()
-                    .frame(maxWidth: 320)
+                    .frame(maxWidth: 360)
                     Spacer()
                 }
 
