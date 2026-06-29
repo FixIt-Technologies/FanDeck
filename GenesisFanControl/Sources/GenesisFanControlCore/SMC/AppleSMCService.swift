@@ -426,18 +426,32 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         ("TC2C", "CPU Core 2", .cpu),
         ("TC3C", "CPU Core 3", .cpu),
         ("TC4C", "CPU Core 4", .cpu),
+        // Apple-Silicon performance cores (M1/M2/M3/M4 — up to 8 per cluster)
         ("Tp09", "CPU Performance Core 1", .cpu),
         ("Tp0T", "CPU Performance Core 2", .cpu),
         ("Tp0b", "CPU Performance Core 3", .cpu),
         ("Tp0d", "CPU Performance Core 4", .cpu),
+        ("Tp01", "CPU Performance Core 5", .cpu),
+        ("Tp05", "CPU Performance Core 6", .cpu),
+        ("Tp0D", "CPU Performance Core 7", .cpu),
+        ("Tp0X", "CPU Performance Core 8", .cpu),
+        // Apple-Silicon efficiency cores
         ("Tp0f", "CPU Efficiency Core 1", .cpu),
         ("Tp0n", "CPU Efficiency Core 2", .cpu),
+        ("Tp0r", "CPU Efficiency Core 3", .cpu),
+        ("Tp0t", "CPU Efficiency Core 4", .cpu),
+        ("Tp0v", "CPU Efficiency Core 5", .cpu),
+        ("Tp0z", "CPU Efficiency Core 6", .cpu),
         // GPU
         ("TG0D", "GPU Die", .gpu),
         ("TG0P", "GPU Proximity", .gpu),
         ("TG0H", "GPU Heatpipe", .gpu),
-        ("Tg0D", "GPU Cluster 1", .gpu),
-        ("Tg0V", "GPU Cluster 2", .gpu),
+        ("Tg05", "GPU Cluster 1", .gpu),
+        ("Tg0D", "GPU Cluster 2", .gpu),
+        ("Tg0L", "GPU Cluster 3", .gpu),
+        ("Tg0T", "GPU Cluster 4", .gpu),
+        ("Tg0V", "GPU Cluster 5", .gpu),
+        ("Tg0d", "GPU Cluster 6", .gpu),
         // Battery
         ("TB0T", "Battery", .battery),
         ("TB1T", "Battery Cell 1", .battery),
@@ -455,8 +469,11 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         // Power
         ("TPDA", "Power Manager Die Avg", .power),
         ("TPSP", "Power Supply Proximity", .power),
-        // Trackpad
+        // Trackpad — different M-series machines expose different keys.
         ("TTPD", "Trackpad", .trackpad),
+        ("Ttp0", "Trackpad", .trackpad),
+        ("TaaP", "Trackpad", .trackpad),
+        ("TaaS", "Trackpad Surface", .trackpad),
     ]
 
     private func discoverSensors() {
@@ -508,7 +525,7 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             ))
         }
 
-        // Sensors
+        // Real sensors
         var newSensors: [TempSensor] = []
         for (key, name, kind) in sensorKeys {
             guard let c = readDouble(key) else { continue }
@@ -516,6 +533,11 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             guard c > -20, c < 130 else { continue }
             newSensors.append(TempSensor(id: key, name: name, kind: kind, celsius: c))
         }
+
+        // Virtual aggregates — avg/max across logical groups. These appear
+        // in both the right rail and the sensor-based mode picker so the
+        // user can target "hottest CPU core" with a single selection.
+        newSensors.append(contentsOf: virtualSensors(from: newSensors))
 
         cachedFans = newFans
         cachedSensors = newSensors
@@ -546,6 +568,86 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         guard high > low else { return fan.minRPM }
         let t = max(0, min(1, (c - low) / (high - low)))
         return fan.minRPM + Int(t * Double(fan.maxRPM - fan.minRPM))
+    }
+
+    // MARK: - Virtual sensors
+
+    /// Compute aggregate temperatures for the picker / right rail. IDs
+    /// are prefixed with "__" so they can't collide with real SMC keys.
+    /// `sensorBased` mode picks them up automatically because the host
+    /// loop in `primeSnapshot()` looks the chosen sensor up by ID inside
+    /// the returned list (which now includes these aggregates).
+    private func virtualSensors(from real: [TempSensor]) -> [TempSensor] {
+        var out: [TempSensor] = []
+
+        // CPU performance cores
+        let perf = real.filter { isPerformanceCore($0.id) }
+        if let avg = avg(perf), let mx = mx(perf) {
+            out.append(.init(id: "__cpu_perf_avg",
+                             name: "CPU Performance · Avg",
+                             kind: .cpu, celsius: avg))
+            out.append(.init(id: "__cpu_perf_max",
+                             name: "CPU Performance · Max",
+                             kind: .cpu, celsius: mx))
+        }
+
+        // CPU efficiency cores
+        let eff = real.filter { isEfficiencyCore($0.id) }
+        if let avg = avg(eff), let mx = mx(eff) {
+            out.append(.init(id: "__cpu_eff_avg",
+                             name: "CPU Efficiency · Avg",
+                             kind: .cpu, celsius: avg))
+            out.append(.init(id: "__cpu_eff_max",
+                             name: "CPU Efficiency · Max",
+                             kind: .cpu, celsius: mx))
+        }
+
+        // Whole-CPU rollup (all cores combined)
+        let allCPU = real.filter { $0.kind == .cpu }
+        if let avg = avg(allCPU), let mx = mx(allCPU) {
+            out.append(.init(id: "__cpu_all_avg",
+                             name: "CPU All Cores · Avg",
+                             kind: .cpu, celsius: avg))
+            out.append(.init(id: "__cpu_all_max",
+                             name: "CPU All Cores · Max",
+                             kind: .cpu, celsius: mx))
+        }
+
+        // GPU clusters
+        let gpu = real.filter { $0.kind == .gpu && $0.id.hasPrefix("Tg") }
+        if let avg = avg(gpu), let mx = mx(gpu) {
+            out.append(.init(id: "__gpu_avg",
+                             name: "GPU Clusters · Avg",
+                             kind: .gpu, celsius: avg))
+            out.append(.init(id: "__gpu_max",
+                             name: "GPU Clusters · Max",
+                             kind: .gpu, celsius: mx))
+        }
+        return out
+    }
+
+    private func isPerformanceCore(_ id: String) -> Bool {
+        // 4-char keys starting with "Tp" and ending in 9 / T / b / d (M1/M2)
+        // or 1 / 5 / D / X (M3/M4 extensions).
+        guard id.hasPrefix("Tp"), id.count == 4 else { return false }
+        let suffix = id.suffix(1)
+        return ["9", "T", "b", "d", "1", "5", "D", "X"].contains(String(suffix))
+    }
+
+    private func isEfficiencyCore(_ id: String) -> Bool {
+        // Efficiency cores use Tp0{f,n,r,t,v,z} on M-series.
+        guard id.hasPrefix("Tp0"), id.count == 4 else { return false }
+        let suffix = id.suffix(1)
+        return ["f", "n", "r", "t", "v", "z"].contains(String(suffix))
+    }
+
+    private func avg(_ xs: [TempSensor]) -> Double? {
+        guard !xs.isEmpty else { return nil }
+        return xs.map(\.celsius).reduce(0, +) / Double(xs.count)
+    }
+
+    private func mx(_ xs: [TempSensor]) -> Double? {
+        xs.map(\.celsius).max()
     }
 
     // MARK: - In-memory mode bookkeeping

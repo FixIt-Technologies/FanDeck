@@ -15,6 +15,7 @@ import GenesisFanControlCore
 struct MainView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var settings: SettingsStore
+    @Environment(\.openSettings) private var openSettings
     @State private var configuringFanID: String?
 
     private let sensorPanelWidth: CGFloat = 280
@@ -45,11 +46,11 @@ struct MainView: View {
     // MARK: - Status bar (overlay)
 
     private var topStatusBar: some View {
-        VStack {
+        VStack(spacing: 0) {
             HStack(spacing: 10) {
                 // Pad past the traffic lights — content now extends behind
                 // them since the title bar is hidden.
-                Color.clear.frame(width: 64, height: 1)
+                Color.clear.frame(width: 70, height: 1)
                 Image(systemName: "fanblades.fill")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(.gfcAmber)
@@ -63,9 +64,7 @@ struct MainView: View {
                 Text("Updated \(timeAgo(appState.lastUpdated))")
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundColor(.gfcTextMuted)
-                Button {
-                    NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-                } label: {
+                Button { openSettings() } label: {
                     Image(systemName: "gearshape.fill")
                         .font(.system(size: 12))
                         .foregroundColor(.gfcTextSecondary)
@@ -74,10 +73,9 @@ struct MainView: View {
                 .help("Open Settings (⌘,)")
             }
             .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 10)
-            // No background fill — window background bleeds through so the
-            // title-bar area merges visually with content below.
+            // Match the macOS title-bar height (28 pt) so the app name +
+            // pill sit on the same baseline as the traffic lights.
+            .frame(height: 28)
             Spacer()
         }
     }
