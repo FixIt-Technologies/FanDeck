@@ -9,6 +9,7 @@
 //
 
 import SwiftUI
+import Charts
 import GenesisFanControlCore
 
 struct FanControlSheet: View {
@@ -233,7 +234,7 @@ struct FanControlSheet: View {
         let preview = computedTargetRPM()
         return SettingsCard(icon: "waveform.path.ecg", title: "LIVE PREVIEW",
                             accentColor: .gfcGreen) {
-            VStack(spacing: 6) {
+            VStack(alignment: .leading, spacing: 12) {
                 SettingsInfoRow(label: "Current sensor reading",
                                 value: currentSensorReading())
                 SettingsInfoRow(label: "Projected target RPM",
@@ -241,8 +242,133 @@ struct FanControlSheet: View {
                                 valueColor: .gfcAmber)
                 SettingsInfoRow(label: "Currently reported",
                                 value: "\(fan.currentRPM) RPM")
+                // Sensor-mode ramp curve. The dot marks the live sensor
+                // reading + the RPM the curve maps it to.
+                if mode == .sensor {
+                    rampGraph
+                        .padding(.top, 6)
+                }
             }
         }
+    }
+
+    private var rampGraph: some View {
+        let live = appState.sensor(withID: sensorID)
+        let currentTemp = live?.celsius ?? lowTempC
+        let projected = computedTargetRPM()
+        let xMin = max(0.0, min(lowTempC - 10, 20))
+        let xMax = max(highTempC + 10, 110)
+
+        // Anchor points of the piecewise-linear ramp: clamp before low,
+        // ramp between low and high, clamp after high.
+        let curve: [(temp: Double, rpm: Int)] = [
+            (xMin,        fan.minRPM),
+            (lowTempC,    fan.minRPM),
+            (highTempC,   fan.maxRPM),
+            (xMax,        fan.maxRPM),
+        ]
+
+        return Chart {
+            // Filled area under the ramp for visual mass
+            ForEach(curve.indices, id: \.self) { i in
+                AreaMark(
+                    x: .value("Temp", curve[i].temp),
+                    y: .value("RPM", curve[i].rpm)
+                )
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [Color.gfcCyan.opacity(0.45), Color.gfcCyan.opacity(0.05)],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                )
+                .interpolationMethod(.linear)
+            }
+            // The ramp line itself
+            ForEach(curve.indices, id: \.self) { i in
+                LineMark(
+                    x: .value("Temp", curve[i].temp),
+                    y: .value("RPM", curve[i].rpm)
+                )
+                .foregroundStyle(Color.gfcCyan)
+                .lineStyle(StrokeStyle(lineWidth: 2))
+                .interpolationMethod(.linear)
+            }
+            // Anchor handles — the two user-controllable thresholds
+            PointMark(
+                x: .value("Temp", lowTempC),
+                y: .value("RPM", fan.minRPM)
+            )
+            .foregroundStyle(Color.gfcGreen)
+            .symbolSize(80)
+            .annotation(position: .top, alignment: .center) {
+                Text("\(Int(lowTempC))°")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(.gfcGreen)
+            }
+            PointMark(
+                x: .value("Temp", highTempC),
+                y: .value("RPM", fan.maxRPM)
+            )
+            .foregroundStyle(Color.gfcRed)
+            .symbolSize(80)
+            .annotation(position: .top, alignment: .center) {
+                Text("\(Int(highTempC))°")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(.gfcRed)
+            }
+            // Live cursor — current temp on the curve.
+            RuleMark(x: .value("Now", currentTemp))
+                .foregroundStyle(Color.gfcAmber.opacity(0.35))
+                .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            PointMark(
+                x: .value("Temp", currentTemp),
+                y: .value("RPM", projected)
+            )
+            .foregroundStyle(Color.gfcAmber)
+            .symbolSize(140)
+            .annotation(position: .topTrailing, alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(String(format: "%.1f °C", currentTemp))
+                    Text("→ \(projected) RPM")
+                }
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundColor(.gfcAmber)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.black.opacity(0.55))
+                )
+            }
+        }
+        .chartXScale(domain: xMin...xMax)
+        .chartYScale(domain: 0...fan.maxRPM)
+        .chartXAxis {
+            AxisMarks(values: .stride(by: 20)) { value in
+                AxisGridLine().foregroundStyle(Color.white.opacity(0.06))
+                AxisTick().foregroundStyle(Color.white.opacity(0.15))
+                AxisValueLabel {
+                    if let v = value.as(Double.self) {
+                        Text("\(Int(v))°")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(.gfcTextMuted)
+                    }
+                }
+            }
+        }
+        .chartYAxis {
+            AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { value in
+                AxisGridLine().foregroundStyle(Color.white.opacity(0.06))
+                AxisValueLabel {
+                    if let v = value.as(Int.self) {
+                        Text("\(v)")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(.gfcTextMuted)
+                    }
+                }
+            }
+        }
+        .frame(height: 160)
     }
 
     // MARK: - Footer (Cancel / Apply)
