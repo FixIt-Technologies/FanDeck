@@ -11,6 +11,14 @@
 import Foundation
 import Combine
 
+public extension Notification.Name {
+    /// Posted by AppState.setMode every time the user (UI / CLI / helper)
+    /// initiates a mode change. The max-hold watchdog in the GUI listens
+    /// for it to stamp / clear the per-fan deadline clock.
+    /// userInfo: { "fanID": String, "isAuto": Bool }.
+    static let gfcUserSetMode = Notification.Name("dev.foltyn.genesis-fan-control.userSetMode")
+}
+
 @MainActor
 public final class AppState: ObservableObject {
     public static let shared = AppState()
@@ -167,6 +175,18 @@ public final class AppState: ObservableObject {
     public func setMode(_ mode: FanMode, for fanID: String) {
         applyOptimisticMode(mode, for: fanID)
         writeInFlight = true
+        // Stamp the max-hold clock — AppDelegate's watchdog listens
+        // for this and auto-reverts fans held in non-auto for >30 min.
+        // Sent for every user-driven setMode (including .auto, which
+        // CLEARS the hold). The polling-loop's per-tick re-assertion
+        // does NOT post this notification, so silent re-asserts don't
+        // reset the deadline.
+        let isAuto: Bool = { if case .auto = mode { return true } else { return false } }()
+        NotificationCenter.default.post(
+            name: .gfcUserSetMode,
+            object: nil,
+            userInfo: ["fanID": fanID, "isAuto": isAuto]
+        )
 
         let smc = self.smc
         smcQueue.async { [weak self] in
