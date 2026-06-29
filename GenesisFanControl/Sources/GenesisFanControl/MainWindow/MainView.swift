@@ -48,7 +48,7 @@ struct MainView: View {
     private var topStatusBar: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                // Pad past the traffic lights — content now extends behind
+                // Pad past the traffic lights — content extends behind
                 // them since the title bar is hidden.
                 Color.clear.frame(width: 70, height: 1)
                 Image(systemName: "fanblades.fill")
@@ -61,16 +61,9 @@ struct MainView: View {
                 TagPill(text: appState.smc.backendName + (appState.smc.isSimulated ? " · SIM" : ""),
                         color: appState.smc.isSimulated ? .gfcAmber : .gfcGreen)
                 Spacer()
-                Text("Updated \(timeAgo(appState.lastUpdated))")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundColor(.gfcTextMuted)
-                Button { openSettings() } label: {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(.gfcTextSecondary)
-                }
-                .buttonStyle(.plain)
-                .help("Open Settings (⌘,)")
+                // The right-hand controls (Updated, gear) live in the
+                // SensorPanel header so they stay on the same row as
+                // "TEMPERATURES" instead of one row above it.
             }
             .padding(.horizontal, 12)
             // Match the macOS title-bar height (28 pt) so the app name +
@@ -78,6 +71,10 @@ struct MainView: View {
             .frame(height: 28)
             Spacer()
         }
+        // Without this the SwiftUI safe-area inset for the (hidden) title
+        // bar pushes the VStack down ~28 pt — landing the row BELOW the
+        // traffic lights instead of beside them.
+        .ignoresSafeArea(.container, edges: .top)
     }
 
     // MARK: - Fans column

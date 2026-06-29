@@ -12,6 +12,7 @@ import GenesisFanControlCore
 struct SensorPanel: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var settings: SettingsStore
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -39,6 +40,9 @@ struct SensorPanel: View {
                 .frame(width: 1),
             alignment: .leading
         )
+        // Without this the right rail leaves a black gap above
+        // TEMPERATURES (safe-area inset reserved for the hidden title bar).
+        .ignoresSafeArea(.container, edges: .top)
     }
 
     private var header: some View {
@@ -50,13 +54,25 @@ struct SensorPanel: View {
                 .font(.system(size: 10, weight: .bold))
                 .tracking(0.8)
                 .foregroundColor(.gfcTextSecondary)
-            Spacer()
             Text("\(filteredSensors.count)")
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                 .foregroundColor(.gfcTextMuted)
+            Spacer()
+            Text("Updated \(timeAgo(appState.lastUpdated))")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundColor(.gfcTextMuted)
+            Button { openSettings() } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(.gfcTextSecondary)
+            }
+            .buttonStyle(.plain)
+            .help("Open Settings (⌘,)")
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        // Same height as the topStatusBar — so TEMPERATURES sits on the
+        // same row as the GenesisFanControl pill on the left.
+        .frame(height: 28)
     }
 
     private var filteredSensors: [TempSensor] {
@@ -70,7 +86,43 @@ struct SensorPanel: View {
         let buckets = Dictionary(grouping: filteredSensors, by: { $0.kind })
         return SensorKind.allCases.compactMap { k in
             guard let xs = buckets[k], !xs.isEmpty else { return nil }
-            return (kind: k, sensors: xs)
+            // Order so virtuals sit IMMEDIATELY AFTER the real sensors
+            // they aggregate (Perf cores → Perf avg/max → Eff cores →
+            // Eff avg/max → … → All-cores avg/max at the bottom).
+            return (kind: k, sensors: xs.sorted { sortKey($0) < sortKey($1) })
+        }
+    }
+
+    private func timeAgo(_ date: Date) -> String {
+        let s = Int(Date().timeIntervalSince(date))
+        if s < 0 || date == .distantPast { return "—" }
+        if s < 2 { return "just now" }
+        return "\(s)s ago"
+    }
+
+    /// Sort key used inside a single-kind group so aggregate sensors
+    /// land next to their source group, not lumped at the end.
+    private func sortKey(_ s: TempSensor) -> Int {
+        switch s.id {
+        case "__cpu_perf_avg": return 90
+        case "__cpu_perf_max": return 91
+        case "__cpu_eff_avg":  return 190
+        case "__cpu_eff_max":  return 191
+        case "__gpu_avg":      return 90
+        case "__gpu_max":      return 91
+        case "__cpu_all_avg":  return 990
+        case "__cpu_all_max":  return 991
+        default:
+            // Real Tp0X performance cores get 1..8; efficiency get 100..105.
+            if s.id.hasPrefix("Tp0"), s.id.count == 4 {
+                let last = String(s.id.suffix(1))
+                let perf = ["9","T","b","d","1","5","D","X"]
+                if let i = perf.firstIndex(of: last) { return 1 + i }
+                let eff = ["f","n","r","t","v","z"]
+                if let i = eff.firstIndex(of: last) { return 100 + i }
+            }
+            if s.id.hasPrefix("Tg0"), s.id.count == 4 { return 1 }
+            return 500 // everything else (TC0E etc) drops below the cores
         }
     }
 }
@@ -129,23 +181,59 @@ private struct SensorRow: View {
     let precise: Bool
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text(sensor.name)
-                .font(.system(size: 10))
-                .foregroundColor(.gfcText)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Spacer(minLength: 4)
-            Text(sensor.formatted(useFahrenheit: useFahrenheit, precise: precise))
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(colorForTemp(sensor.celsius))
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(sensor.name)
+                    .font(.system(size: 10))
+                    .foregroundColor(.gfcText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                Text(sensor.formatted(useFahrenheit: useFahrenheit, precise: precise))
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(colorForTemp(sensor.celsius))
+            }
+            .padding(.horizontal, 6)
+            .padding(.top, 3)
+            tempBar
+                .padding(.horizontal, 6)
+                .padding(.bottom, 3)
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
         .background(
             RoundedRectangle(cornerRadius: 4)
                 .fill(Color.white.opacity(0.02))
         )
+    }
+
+    /// Temperature meter — 2 px tall bar under each row, filled to
+    /// (celsius / 100). Animates the width whenever the reading changes
+    /// so the panel pulses in real time as the polling tick updates.
+    private var tempBar: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                // Faint track behind the fill so empty space reads as "0%".
+                Capsule()
+                    .fill(Color.white.opacity(0.04))
+                    .frame(height: 2)
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [colorForTemp(sensor.celsius).opacity(0.65),
+                                     colorForTemp(sensor.celsius)],
+                            startPoint: .leading, endPoint: .trailing
+                        )
+                    )
+                    .frame(width: max(1, geo.size.width * fractionOfHundred),
+                           height: 2)
+                    .shadow(color: colorForTemp(sensor.celsius).opacity(0.55), radius: 1.5)
+                    .animation(.easeOut(duration: 0.6), value: sensor.celsius)
+            }
+        }
+        .frame(height: 2)
+    }
+
+    private var fractionOfHundred: CGFloat {
+        CGFloat(max(0, min(1, sensor.celsius / 100)))
     }
 
     private func colorForTemp(_ c: Double) -> Color {
