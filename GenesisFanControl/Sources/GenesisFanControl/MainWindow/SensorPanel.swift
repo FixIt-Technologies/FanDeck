@@ -213,24 +213,18 @@ private struct SensorRow: View {
     /// Temperature meter — 2 px tall bar under each row, filled to
     /// (celsius / 100). Animates the width whenever the reading changes
     /// so the panel pulses in real time as the polling tick updates.
+    /// Kept low-opacity / no glow so it reads as ambient context, not as
+    /// a focal element competing with the sensor name + temperature label.
     private var tempBar: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                // Faint track behind the fill so empty space reads as "0%".
                 Capsule()
                     .fill(Color.white.opacity(0.04))
                     .frame(height: 2)
                 Capsule()
-                    .fill(
-                        LinearGradient(
-                            colors: [colorForTemp(sensor.celsius).opacity(0.65),
-                                     colorForTemp(sensor.celsius)],
-                            startPoint: .leading, endPoint: .trailing
-                        )
-                    )
+                    .fill(colorForTemp(sensor.celsius).opacity(0.35))
                     .frame(width: max(1, geo.size.width * fractionOfHundred),
                            height: 2)
-                    .shadow(color: colorForTemp(sensor.celsius).opacity(0.55), radius: 1.5)
                     .animation(.easeOut(duration: 0.6), value: sensor.celsius)
             }
         }

@@ -238,8 +238,13 @@ private struct SetpointWall: View {
     let emphasised: Bool
 
     var body: some View {
-        ZStack(alignment: .top) {
-            // The wall — a vertical bar through the gauge
+        // .topLeading + explicit width so child offsets are measured from
+        // x = 0 (the gauge's leading edge). With the default `.top`
+        // alignment (horizontal=center) the wall rectangle would start at
+        // (innerZStackWidth - rectWidth)/2 and the `.offset(x:)` would
+        // shift it from that centered base — leaving a visible gap between
+        // the fill's right edge and the wall.
+        ZStack(alignment: .topLeading) {
             Rectangle()
                 .fill(
                     LinearGradient(
@@ -253,9 +258,6 @@ private struct SetpointWall: View {
                 .offset(x: x - (emphasised ? 2 : 1.5), y: -4)
                 .animation(.easeOut(duration: 0.1), value: emphasised)
 
-            // RPM tag — always visible below the wall so the user sees the
-            // exact trigger value. Width estimated from char count so we
-            // can keep it inside the gauge.
             let estimatedWidth: CGFloat = CGFloat(label.count) * 6 + 12
             Text(label)
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -272,6 +274,7 @@ private struct SetpointWall: View {
                                  upper: max(0, totalWidth - estimatedWidth)),
                         y: height + 4)
         }
+        .frame(width: totalWidth, height: height + 24, alignment: .topLeading)
     }
 
     private func clamp(_ v: CGFloat, lower: CGFloat, upper: CGFloat) -> CGFloat {
