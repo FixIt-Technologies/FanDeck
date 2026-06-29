@@ -155,7 +155,14 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
 
     /// Convenience init that returns nil if AppleSMC can't be opened
     /// (e.g. running in a sandbox without the kext, headless CI, etc.).
-    public init?(helperClient: HelperClient = HelperClient()) {
+    /// `forceSafeReset` (default true) drops every fan we find in
+    /// F0Md=1 back to F0Md=0 (auto) before the first snapshot. This
+    /// closes review HIGH #5: if a previous run crashed mid-constant,
+    /// thermalmonitord left F0Tg at whatever it last clamped, and a
+    /// fresh init would otherwise adopt that value as "user intent"
+    /// and re-assert it forever. Opt-out path exists for tests.
+    public init?(helperClient: HelperClient = HelperClient(),
+                 forceSafeReset: Bool = true) {
         self.helperClient = helperClient
         // Catch struct-layout regressions before they corrupt SMC writes.
         precondition(MemoryLayout<SMCParamStruct>.stride == 80,
@@ -168,7 +175,28 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         discoverFans()
         discoverSensors()
         Log.smc.info("AppleSMC discovered \(fanIndices.count) fans, \(sensorKeys.count) temperature sensors")
+        if forceSafeReset {
+            safeResetAllFansToAuto()
+        }
         primeSnapshot()
+    }
+
+    /// Drop every fan currently in CONSTANT mode back to AUTO. Called
+    /// at the start of every launch so a crashed previous run can't
+    /// strand a fan pinned at the wrong RPM. Best-effort: failures are
+    /// logged but don't block startup (helper might not be installed
+    /// yet on first launch — user has to opt in via the elevation
+    /// banner anyway).
+    private func safeResetAllFansToAuto() {
+        for i in fanIndices {
+            let md = readDouble(modeKey(forFan: i)) ?? 0
+            guard md >= 1 else { continue }
+            // Use the same .auto path setMode does — direct then helper
+            // fallback. Errors are logged inside.
+            let fanID = "F\(i)"
+            let ok = setMode(.auto, for: fanID)
+            Log.fans.info("safeResetAllFansToAuto: \(fanID) was in CONSTANT, reset → \(ok ? "OK" : "failed (helper not yet available?)")")
+        }
     }
 
     deinit {
@@ -307,10 +335,24 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         return false
     }
 
+    /// Safety floor for any RPM write. The UI clamps in
+    /// `AppState.applyOptimisticMode` but that's display-only; raw CLI /
+    /// helper / programmatic calls bypass it. Anything below 800 RPM
+    /// will be silently bumped — most Apple Silicon Macs spin their
+    /// fans at 1200+ RPM minimum, and an actual 0 written into F0Tg can
+    /// stall the bearing (review HIGH #2).
+    private static let absoluteMinSafeRPM: Int = 800
+
     /// Write a target RPM honoring the key's actual data type. On
     /// Apple Silicon `F\(i)Tg` is `flt ` (4-byte IEEE 754); on Intel
-    /// it's `fpe2` (2-byte 14.2 fixed-point).
-    private func writeRPM(fanIdx: Int, rpm: Int) -> Bool {
+    /// it's `fpe2` (2-byte 14.2 fixed-point). Caller-supplied `rpm` is
+    /// clamped against the absolute floor BEFORE encoding so no path
+    /// (CLI, helper, host re-assertion) can hit zero.
+    private func writeRPM(fanIdx: Int, rpm rawRPM: Int) -> Bool {
+        let rpm = max(Self.absoluteMinSafeRPM, rawRPM)
+        if rpm != rawRPM {
+            Log.fans.debug("Clamped F\(fanIdx)Tg write \(rawRPM) → \(rpm) (safety floor)")
+        }
         let key = "F\(fanIdx)Tg"
         var info = SMCParamStruct()
         info.key = fourCC(key)

@@ -75,6 +75,14 @@ struct MainView: View {
         // bar pushes the VStack down ~28 pt — landing the row BELOW the
         // traffic lights instead of beside them.
         .ignoresSafeArea(.container, edges: .top)
+        // CRITICAL: this overlay is purely decorative (Image + Text + pill
+        // + Spacer; zero interactive controls). It sits on top of the
+        // SensorPanel header in the ZStack — and SwiftUI's HStack claims
+        // hit-testing for its WHOLE frame width, even where there's just
+        // a Spacer. Without this modifier the gear button in SensorPanel
+        // (also at y=0..28) never receives clicks — they're consumed by
+        // this strip and dropped. Diagnosed via SwiftUI expert skill.
+        .allowsHitTesting(false)
     }
 
     // MARK: - Fans column
