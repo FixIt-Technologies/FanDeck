@@ -7,7 +7,7 @@
 //
 
 import SwiftUI
-import AppKit
+import AppKit  // NSApp.sendAction for the gear button
 import GenesisFanControlCore
 
 struct SensorPanel: View {
@@ -63,27 +63,25 @@ struct SensorPanel: View {
                 .foregroundColor(.gfcTextMuted)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-            // The header sits in the safe-area-ignored region (0..28pt =
-            // the hidden title-bar zone), which is a window-drag handle by
-            // default — AppKit eats button clicks there before SwiftUI
-            // sees them. NoDragArea wraps the gear in an NSView whose
-            // mouseDownCanMoveWindow returns false, so clicks reach the
-            // Button. Tap target is also a chunky 24pt rather than 12pt
-            // so the user doesn't have to pixel-hunt.
-            NoDragArea {
-                Button {
-                    NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-                } label: {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.gfcTextSecondary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Open Settings (⌘,)")
+            // 24pt tap area on top of the 13pt glyph — the original
+            // 12pt-only contentShape was too small to hit reliably in
+            // the title-bar header. SwiftUI Button's underlying NSButton
+            // already returns false from `mouseDownCanMoveWindow`, so
+            // we don't need an NSViewRepresentable wrapper (an earlier
+            // attempt at one — NoDragArea — threw an autolayout
+            // exception during a later constraint-update pass and
+            // aborted the process, deleted in this commit).
+            Button {
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.gfcTextSecondary)
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
             }
-            .frame(width: 24, height: 24)
+            .buttonStyle(.plain)
+            .help("Open Settings (⌘,)")
         }
         .padding(.horizontal, 12)
         // Same height as the topStatusBar — TEMPERATURES sits on the
