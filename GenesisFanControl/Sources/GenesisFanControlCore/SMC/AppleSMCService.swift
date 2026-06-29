@@ -505,13 +505,26 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             } else {
                 baseMode = .auto
             }
-            // Preserve a sensor-based mode the host is driving even though
-            // the SMC itself doesn't expose that state.
+            // Preserve host-driven modes — SMC doesn't reliably report
+            // them back to us:
+            //  • .sensorBased: SMC has no concept of it, so we keep ours.
+            //  • .constant: Apple Silicon's thermalmonitord can clamp F0Tg
+            //    back to whatever it thinks the current load needs (e.g.
+            //    we wrote 5500, readback returns 4142). Trust the value
+            //    we last wrote, not the firmware's claw-back. The host
+            //    loop at the bottom of this method re-asserts the write
+            //    on every tick so the physical fan stays where we put it.
             let mode: FanMode
+            let displayedTarget: Int
             if case .sensorBased = existing?.mode {
                 mode = existing!.mode
+                displayedTarget = existing?.targetRPM ?? Int(target)
+            } else if case .constant(let cachedRPM) = existing?.mode, md >= 1 {
+                mode = .constant(rpm: cachedRPM)
+                displayedTarget = cachedRPM
             } else {
                 mode = baseMode
+                displayedTarget = Int(target)
             }
 
             newFans.append(Fan(
@@ -520,7 +533,7 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
                 minRPM: Int(minR),
                 maxRPM: Int(maxR),
                 currentRPM: Int(actual),
-                targetRPM: Int(target),
+                targetRPM: displayedTarget,
                 mode: mode
             ))
         }
@@ -542,14 +555,25 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         cachedFans = newFans
         cachedSensors = newSensors
 
-        // Host-side sensor-based mode → push the right target this tick.
+        // Host-side per-tick fan-control re-assertion. Two cases:
+        //  • .sensorBased: compute the curve value from the chosen sensor.
+        //  • .constant: re-push the user's setpoint. Apple Silicon's
+        //    thermalmonitord otherwise claws F0Tg back to whatever it
+        //    thinks the current load needs, so the physical fan drifts
+        //    away from what the user pinned. One writeRPM/tick is cheap
+        //    and keeps the firmware honest.
         for fan in cachedFans {
-            if case .sensorBased(let sid, let lo, let hi) = fan.mode,
-               let s = newSensors.first(where: { $0.id == sid }) {
-                let target = rpmForTemp(s.celsius, fan: fan, low: lo, high: hi)
-                if let fanIdx = Int(fan.id.dropFirst()) {
+            guard let fanIdx = Int(fan.id.dropFirst()) else { continue }
+            switch fan.mode {
+            case .sensorBased(let sid, let lo, let hi):
+                if let s = newSensors.first(where: { $0.id == sid }) {
+                    let target = rpmForTemp(s.celsius, fan: fan, low: lo, high: hi)
                     _ = writeRPM(fanIdx: fanIdx, rpm: target)
                 }
+            case .constant(let rpm):
+                _ = writeRPM(fanIdx: fanIdx, rpm: rpm)
+            case .auto:
+                break
             }
         }
     }
