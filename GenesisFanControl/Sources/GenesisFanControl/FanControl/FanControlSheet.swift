@@ -45,19 +45,29 @@ struct FanControlSheet: View {
 
     init(fan: Fan) {
         self.fan = fan
+        // Defaults for sensor-based mode when the fan is in auto/constant.
+        // Lookup order: this fan's saved config → any sibling fan's saved
+        // config (so the second fan inherits from the first) → hard-coded
+        // 45/85 fallback. The picked sensor falls back to the first
+        // available aggregate / CPU sensor at the call site if "TC0E"
+        // (Intel) isn't present on Apple Silicon.
+        let saved = SettingsStore.shared.sensorRampConfig(for: fan.id)
+        let defaultSensor = saved?.sensorId ?? "__cpu_all_max"
+        let defaultLow = saved?.lowTempC ?? 45
+        let defaultHigh = saved?.highTempC ?? 85
         switch fan.mode {
         case .auto:
             self._mode = State(initialValue: .auto)
             self._constantRPM = State(initialValue: Double(fan.minRPM))
-            self._sensorID = State(initialValue: "TC0E")
-            self._lowTempC = State(initialValue: 45)
-            self._highTempC = State(initialValue: 85)
+            self._sensorID = State(initialValue: defaultSensor)
+            self._lowTempC = State(initialValue: defaultLow)
+            self._highTempC = State(initialValue: defaultHigh)
         case .constant(let rpm):
             self._mode = State(initialValue: .constant)
             self._constantRPM = State(initialValue: Double(rpm))
-            self._sensorID = State(initialValue: "TC0E")
-            self._lowTempC = State(initialValue: 45)
-            self._highTempC = State(initialValue: 85)
+            self._sensorID = State(initialValue: defaultSensor)
+            self._lowTempC = State(initialValue: defaultLow)
+            self._highTempC = State(initialValue: defaultHigh)
         case .sensorBased(let sid, let low, let high):
             self._mode = State(initialValue: .sensor)
             self._constantRPM = State(initialValue: Double(fan.minRPM))
@@ -406,6 +416,15 @@ struct FanControlSheet: View {
                 .buttonStyle(SecondaryButtonStyle())
                 .keyboardShortcut(.cancelAction)
             Button("Apply") {
+                // Persist the sensor-based config whenever the user has
+                // touched it — even if the active mode they're applying is
+                // constant or auto. That way switching back to sensor-based
+                // later restores exactly what they had configured.
+                settings.saveSensorRampConfig(
+                    SensorRampConfig(sensorId: sensorID,
+                                     lowTempC: lowTempC,
+                                     highTempC: highTempC),
+                    for: fan.id)
                 appState.setMode(applyMode(), for: fan.id)
                 dismiss()
             }

@@ -10,6 +10,22 @@
 import Foundation
 import Combine
 
+/// Persisted sensor-based fan config per fanID. Lets us restore the
+/// user's chosen sensor + thresholds when they switch a fan to constant
+/// or auto and later back to sensor-based, and lets a fresh fan inherit
+/// from a sibling that already has a config.
+public struct SensorRampConfig: Codable, Equatable, Sendable {
+    public var sensorId: String
+    public var lowTempC: Double
+    public var highTempC: Double
+
+    public init(sensorId: String, lowTempC: Double, highTempC: Double) {
+        self.sensorId = sensorId
+        self.lowTempC = lowTempC
+        self.highTempC = highTempC
+    }
+}
+
 public enum MenuBarIconStyle: String, Codable, CaseIterable, Identifiable, Sendable {
     case color
     case monochrome
@@ -90,6 +106,28 @@ public final class SettingsStore: ObservableObject {
         }
     }
 
+    // MARK: - Per-fan sensor-based config (preserved across mode switches)
+    @Published public var sensorRampConfigs: [String: SensorRampConfig] {
+        didSet {
+            if let data = try? JSONEncoder().encode(sensorRampConfigs) {
+                ud.set(data, forKey: K.sensorRampConfigs)
+            }
+        }
+    }
+
+    /// Look up a starting config for `fanID` when entering sensor-based
+    /// mode: prefer the fan's own saved config; otherwise inherit from
+    /// any other fan's saved config (the "copy from sibling" behavior);
+    /// otherwise nil so the caller can pick sensible defaults.
+    public func sensorRampConfig(for fanID: String) -> SensorRampConfig? {
+        if let own = sensorRampConfigs[fanID] { return own }
+        return sensorRampConfigs.first?.value
+    }
+
+    public func saveSensorRampConfig(_ config: SensorRampConfig, for fanID: String) {
+        sensorRampConfigs[fanID] = config
+    }
+
     // MARK: - Persistence backend
 
     private let ud: UserDefaults
@@ -107,6 +145,7 @@ public final class SettingsStore: ObservableObject {
         public static let menuBarIconStyle = "menubar.iconStyle"
         public static let menuBarFan = "menubar.fan"
         public static let menuBarSensorIDs = "menubar.sensorIDs"
+        public static let sensorRampConfigs = "fans.sensorRampConfigs"
     }
 
     /// Designated init — defaults to `.standard`. Tests can inject a
@@ -129,6 +168,12 @@ public final class SettingsStore: ObservableObject {
             menuBarSensorIDs = arr
         } else {
             menuBarSensorIDs = []
+        }
+        if let data = ud.data(forKey: K.sensorRampConfigs),
+           let dict = try? JSONDecoder().decode([String: SensorRampConfig].self, from: data) {
+            sensorRampConfigs = dict
+        } else {
+            sensorRampConfigs = [:]
         }
         Log.settings.debug("SettingsStore loaded")
     }
