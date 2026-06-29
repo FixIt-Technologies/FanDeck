@@ -20,11 +20,32 @@ public final class HelperClient: @unchecked Sendable {
         self.socketPath = socketPath
     }
 
-    /// Quick liveness check — returns true if the daemon answers a ping
-    /// with `ok=true`. Used to clear the elevation banner.
+    /// Helper liveness + protocol-compat result. Drives the elevation
+    /// banner: `.down` and `.outdated` both raise it; only `.healthy`
+    /// clears it.
+    public enum Health: Equatable {
+        case down                                  // socket unreachable
+        case outdated(installed: Int, current: Int) // running but stale
+        case healthy(version: Int)                 // running and matching
+    }
+
+    public func health() -> Health {
+        guard let resp = try? send(.ping), resp.ok else { return .down }
+        // Older helpers may not include protocolVersion in the response
+        // (the field is Optional). Treat missing == 1.
+        let installed = resp.protocolVersion ?? 1
+        if installed == HelperConstants.protocolVersion {
+            return .healthy(version: installed)
+        }
+        return .outdated(installed: installed, current: HelperConstants.protocolVersion)
+    }
+
+    /// Quick liveness check — true iff the helper answers AND its
+    /// protocol matches ours. Use `health()` when you need to
+    /// distinguish "down" from "outdated".
     public func ping() -> Bool {
-        guard let resp = try? send(.ping) else { return false }
-        return resp.ok
+        if case .healthy = health() { return true }
+        return false
     }
 
     /// Forwards a `FanMode` to the helper. Returns true on success.

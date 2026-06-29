@@ -26,6 +26,10 @@ public final class AppState: ObservableObject {
     /// While `installHelper()` is running so the UI can show a spinner.
     @Published public private(set) var helperInstalling: Bool = false
     @Published public var helperInstallError: String?
+    /// Most recent helper liveness/version check. Drives the banner copy
+    /// so we can say "Install Helper" (down) vs. "Update Helper" (stale
+    /// installed version vs. current).
+    @Published public private(set) var helperHealth: HelperClient.Health = .down
     /// True while at least one SMC write is in flight — UI can show a
     /// spinner / disable controls if it wants.
     @Published public private(set) var writeInFlight: Bool = false
@@ -75,12 +79,30 @@ public final class AppState: ObservableObject {
         smcQueue.async { [weak self] in
             smc.refresh()
             let snap = smc.snapshot()
-            let isUp = helperClient.ping()
+            let health = helperClient.health()
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.publish(snapshot: snap)
-                if isUp != self.helperAvailable { self.helperAvailable = isUp }
-                if isUp { self.needsElevation = false }
+                self.helperHealth = health
+                switch health {
+                case .healthy:
+                    self.helperAvailable = true
+                    // Only auto-clear the banner if the user hasn't been
+                    // told they need to act. installHelperError stays
+                    // around so the user sees the result of their last
+                    // attempt.
+                    self.needsElevation = false
+                case .outdated:
+                    self.helperAvailable = true
+                    self.needsElevation = true
+                case .down:
+                    self.helperAvailable = false
+                    // Don't auto-flip needsElevation on .down alone — a
+                    // brand-new launch with no helper installed should
+                    // wait for the first failed write to surface the
+                    // banner, otherwise users see it before they've
+                    // tried to do anything.
+                }
             }
         }
     }

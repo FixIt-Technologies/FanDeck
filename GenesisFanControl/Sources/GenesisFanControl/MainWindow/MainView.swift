@@ -21,14 +21,20 @@ struct MainView: View {
     private let sensorPanelWidth: CGFloat = 280
 
     var body: some View {
+        // ZStack order matters for hit-testing — last-declared wins. We
+        // want the interactive HStack on top so SensorPanel's gear (and
+        // any future buttons in the header strip) reliably receive
+        // clicks. topStatusBar sits BELOW the HStack now, with
+        // allowsHitTesting(false) as belt-and-braces — its decorative
+        // pill / icon would never need clicks anyway.
         ZStack {
             Color.gfcBackground.ignoresSafeArea()
+            topStatusBar
             HStack(spacing: 0) {
                 fansColumn
                 SensorPanel()
                     .frame(width: sensorPanelWidth)
             }
-            topStatusBar
             if appState.needsElevation {
                 elevationBanner
             }
@@ -142,28 +148,45 @@ struct MainView: View {
     }
 
     private var elevationBanner: some View {
+        // Three states the banner can communicate:
+        //   • installing  — spinner, hourglass, just wait
+        //   • outdated    — helper IS running but is an older build than
+        //                   the GUI; needs a re-install to pick up fixes
+        //   • down        — helper isn't running at all (first-time
+        //                   install OR uninstalled)
+        let installing = appState.helperInstalling
+        let outdated: (installed: Int, current: Int)? = {
+            if case .outdated(let inst, let cur) = appState.helperHealth { return (inst, cur) }
+            return nil
+        }()
+        let titleText: String = installing
+            ? "Installing privileged helper…"
+            : (outdated != nil
+                ? "Helper is out of date"
+                : "Fan control needs an elevated helper")
+        let detailText: String = appState.helperInstallError
+            ?? (outdated.map { "The helper running as root is build v\($0.installed); this GUI expects v\($0.current). Click Update to re-install with the latest fixes (you'll be asked for your admin password)." }
+                ?? "Click Install to add a tiny root daemon (you'll be asked for your admin password). After that the app drives fans without sudo.")
+        let buttonLabel = outdated != nil ? "Update Helper" : "Install Helper"
         VStack {
             Spacer()
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: appState.helperInstalling ? "hourglass" : "lock.shield.fill")
+                Image(systemName: installing ? "hourglass" : (outdated != nil ? "arrow.triangle.2.circlepath.circle.fill" : "lock.shield.fill"))
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundColor(.gfcAmber)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(appState.helperInstalling
-                         ? "Installing privileged helper…"
-                         : "Fan control needs an elevated helper")
+                    Text(titleText)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(.gfcText)
-                    Text(appState.helperInstallError
-                         ?? "Click Install to add a tiny root daemon (you'll be asked for your admin password). After that the app drives fans without sudo.")
+                    Text(detailText)
                         .font(.system(size: 11))
                         .foregroundColor(appState.helperInstallError == nil ? .gfcTextSecondary : .gfcRed)
-                        .lineLimit(3)
+                        .lineLimit(4)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
-                if !appState.helperInstalling {
-                    Button("Install Helper") { appState.installHelper() }
+                if !installing {
+                    Button(buttonLabel) { appState.installHelper() }
                         .buttonStyle(PrimaryButtonStyle())
                     Button("Dismiss") { appState.needsElevation = false }
                         .buttonStyle(SecondaryButtonStyle())
