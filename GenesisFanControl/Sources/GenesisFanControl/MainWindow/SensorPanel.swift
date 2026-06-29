@@ -82,8 +82,11 @@ struct SensorPanel: View {
 
     private var filteredSensors: [TempSensor] {
         appState.sensors.filter { s in
-            if s.kind == .storage && !settings.includeSATANVMe { return false }
-            return true
+            switch s.kind {
+            case .storage: return settings.includeSATANVMe
+            case .gpu:     return settings.includeEGPU
+            default:       return true
+            }
         }
     }
 

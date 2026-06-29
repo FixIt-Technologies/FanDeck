@@ -14,31 +14,34 @@ import GenesisFanControlCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
 
-    nonisolated func applicationDidFinishLaunching(_ notification: Notification) {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            Log.logAppLaunch()
-            Log.logSMCBackend(AppState.shared.smc.backendName,
-                              simulated: AppState.shared.smc.isSimulated)
+    // AppDelegate is @MainActor, so this method is already main-actor
+    // isolated — no Task hop needed. Running startup synchronously here
+    // guarantees the activation policy + menu-bar item are installed
+    // before the first window renders. Observer callbacks still hop via
+    // Task { @MainActor } because the NSNotificationCenter closures are
+    // not actor-isolated even on queue: .main.
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        Log.logAppLaunch()
+        Log.logSMCBackend(AppState.shared.smc.backendName,
+                          simulated: AppState.shared.smc.isSimulated)
 
-            self.applyActivationPolicy()
-            self.installMenuBarItem()
+        applyActivationPolicy()
+        installMenuBarItem()
 
-            NotificationCenter.default.addObserver(forName: .mfcShowDockIconChanged,
-                                                   object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.applyActivationPolicy() }
-            }
-            // Re-promote to .regular whenever a window becomes key. Without
-            // this, ⌘-Tab can't bring the app back when showDockIcon=false
-            // (.accessory apps are excluded from the switcher).
-            NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
-                                                   object: nil, queue: .main) { [weak self] note in
-                Task { @MainActor in self?.windowDidBecomeKey(note) }
-            }
-            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
-                                                   object: nil, queue: .main) { [weak self] note in
-                Task { @MainActor in self?.mainWindowWillClose(note) }
-            }
+        NotificationCenter.default.addObserver(forName: .mfcShowDockIconChanged,
+                                               object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.applyActivationPolicy() }
+        }
+        // Re-promote to .regular whenever a window becomes key. Without
+        // this, ⌘-Tab can't bring the app back when showDockIcon=false
+        // (.accessory apps are excluded from the switcher).
+        NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
+                                               object: nil, queue: .main) { [weak self] note in
+            Task { @MainActor in self?.windowDidBecomeKey(note) }
+        }
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
+                                               object: nil, queue: .main) { [weak self] note in
+            Task { @MainActor in self?.mainWindowWillClose(note) }
         }
     }
 

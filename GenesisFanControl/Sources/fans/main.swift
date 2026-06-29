@@ -162,7 +162,11 @@ final class FansCLI {
                 .map { "\($0.id):\(String(format: "%.1f°C", $0.celsius))" } ?? "—"
             let ts = ISO8601DateFormatter().string(from: Date())
             print("\(ts)  \(headline)  \(f)")
-            Thread.sleep(forTimeInterval: interval)
+            // RunLoop.run(until:) pumps the main run loop during the wait
+            // so queued `@MainActor` tasks (e.g. Log.* publishing into
+            // LogStore) actually execute. Thread.sleep would block the
+            // run loop and starve those tasks indefinitely.
+            RunLoop.current.run(until: Date().addingTimeInterval(interval))
         }
     }
 
