@@ -523,6 +523,29 @@ Because the .app's binaries are symlinks, every `swift build` is
 honors symlinks inside `.app` bundles fine (LaunchServices follows them
 for the main executable).
 
+### ⚠ install:app DOES NOT update the installed helper at /usr/local/sbin/
+
+The launchd helper lives at `/usr/local/sbin/genesis-fan-control-helper`
+(root:wheel, copied by the *one-time* `HelperInstaller` admin prompt).
+`install:app` only handles the **unprivileged** GUI + CLI — it can't
+overwrite the root-owned helper without re-prompting. So after a
+helper-side code change (anything inside `AppleSMCService` that the
+helper compiles into its binary), the GUI runs the new code but the
+installed helper is still the old one.
+
+**Mitigation (automatic):** `HelperConstants.protocolVersion` is
+bumped on every helper-side fix. `HelperClient.health()` compares the
+running helper's reported version against the GUI's compiled version
+each tick. On mismatch, `AppState` raises a persistent elevation
+banner with copy "Helper is out of date — installed v1, GUI expects
+v2" and an **"Update Helper"** button that re-runs the admin install
+flow. User clicks once, helper updates, banner clears.
+
+**Bump-on-every-helper-change rule:** when you edit any code that the
+helper picks up (anything in `AppleSMCService`, `HelperProtocol`, the
+helper's `main.swift`), increment `protocolVersion`. Otherwise the
+GUI won't know the installed copy is stale.
+
 ### Why a release `.app` instead of running `.build/debug/` directly?
 
 Three reasons:
@@ -758,6 +781,106 @@ what's still open.
   servers / setups where the GUI shouldn't be loaded.
 - **Sensor history graph.** A 10-minute sparkline per sensor in the
   right rail, replacing the current point reading.
+
+---
+
+## Troubleshooting & dev gotchas
+
+Hard-won lessons. These have all been mis-diagnosed at least once.
+
+**Gear button doesn't open Settings.** It's a hit-testing bug, not an
+action-dispatch bug. SwiftUI ZStack hit-tests last-declared-first; if
+a decorative overlay sits above the SensorPanel header, its HStack +
+trailing Spacer claims the whole 28pt strip width and swallows clicks.
+Fix: declare the interactive HStack AFTER decorative overlays in the
+ZStack, AND put `.allowsHitTesting(false)` on the decorative side.
+Don't reach for SettingsLink / NSApp.sendAction / NSViewRepresentable
+wrappers until you've confirmed the click is actually reaching the
+Button.
+
+**App crashes with EXC_CRASH / SIGABRT during layout.** Look for
+`NSHostingView.SizeConstraints.update(from:)` in the backtrace — that's
+the `NSViewRepresentable` bridge throwing an autolayout exception.
+Usually caused by an `NSHostingView` with `translatesAutoresizingMask
+IntoConstraints = false` + explicit edge constraints whose SwiftUI
+content wants to renegotiate its intrinsic size on a later render
+pass. Drop the constraints and let the hosting view drive its own
+size, OR avoid the bridge entirely (SwiftUI Button already handles
+`mouseDownCanMoveWindow = false`).
+
+**Fan setpoint reverts to firmware-clamped value after a few seconds.**
+thermalmonitord claws back `F0Tg` under thermal governance. The host
+loop in `primeSnapshot()` MUST re-assert every poll tick — that's the
+mechanism, not maintenance. Any new mode (or future helper RPC) that
+sets a target without also re-asserting will drift back. If a new
+write succeeds initially but drifts within ~5s, suspect this.
+
+**Click "Auto" → UI blinks to auto → snaps back to constant.**
+`setMode(.auto)` is writing `Ftst=0` BEFORE `F0Md=0`. Firmware re-locks
+the moment Ftst goes 1→0 and ignores subsequent F0Md writes. Reverse
+the order.
+
+**Helper write failed, banner didn't pop.** The installed helper at
+`/usr/local/sbin/` is older than the protocol version. Bump
+`HelperConstants.protocolVersion` to force the GUI's `health()` check
+to flag it `.outdated` → banner pops with "Update Helper".
+
+**`fans set F0 sensor ...` from the CLI works briefly then drifts.**
+CLI sets the mode but the CLI process exits immediately; the per-tick
+re-assertion only runs from the GUI. Either keep the GUI open or use
+`fans watch` (which has its own RunLoop).
+
+**Tests `testTickAdvancesLastUpdated` / `testTickRefreshesSensors`
+fail.** They make a synchronous assertion right after calling
+`state.tick()` — but `tick()` dispatches onto `smcQueue` and hops the
+publish back to `@MainActor`. Use `drainTicks()` (in
+`AppStateTests.swift`) to spin the runloop briefly between
+`tick()` and the assertion.
+
+**App relaunches but new binary doesn't seem to load.** macOS may
+cache the app launch services entry. Confirm via `ls -la
+/Applications/GenesisFanControl.app/Contents/MacOS/GenesisFanControl`
+that it's a symlink into `.build/release/`. If it points somewhere
+old, `bun run uninstall:app` + `bun run install:app` to rebuild from
+scratch.
+
+---
+
+## Changelog (recent work)
+
+In rough order shipped, newest at top. Full commit messages tell the
+"why" — git log is the source of truth.
+
+- **6911ae6** — README rewrite (this section + the others).
+- **11b6a0c** — Gear button finally clickable (ZStack reorder + 
+  `.allowsHitTesting(false)` on topStatusBar). Helper protocol
+  versioning + auto-pop "Helper is out of date" banner.
+- **7b244ed** — First (incomplete) gear-button fix and continuation
+  of the safety-floor pass (writeRPM clamps to 800; cold-start
+  `safeResetAllFansToAuto`).
+- **ba6fe96** — Crash fix: remove NoDragArea — was throwing an
+  autolayout exception out of `NSHostingView.SizeConstraints.update`
+  and aborting the process.
+- **3a3d3a8** — URGENT: AUTO release direction fix (F0Md=0 BEFORE
+  Ftst=0) + 3-way fallback gear button (which still didn't work, see
+  11b6a0c).
+- **725405f** — N-point ramp curve UI + data model: RampPoint,
+  piecewise-linear interpolation, draggable chart handles + per-point
+  editor.
+- **3b58d8e** — Persist sensor-based config per fan; second fan
+  inherits from the first on first sensor-based pick.
+- **e328321** — Sensor picker dropdown shows live temps per row
+  (Menu+Button+Label trick).
+- **c2a99bf** — Per-tick re-assertion via helper for both constant
+  AND sensor-based modes; sensor-based mode actually unlocks fan
+  control; gear button (first attempt — SettingsLink, didn't work).
+- **80a2688** — Three regression fixes: pendingIntent merge stops
+  in-flight setMode flicker; NoDragArea added (later caused crash,
+  see ba6fe96); sensor picker temp-per-row first attempt.
+- **fea184f** — Gauge gap at high RPM (tightened fill shadow);
+  wired `includeExternalDrives` (Tt-prefix).
+- **ecdc10d** — Constant-fan claw-back fix: preserve cached
+  `.constant` mode through snapshots + re-assert every tick.
 
 ---
 
