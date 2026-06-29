@@ -137,7 +137,10 @@ final class MockSMCServiceTests: XCTestCase {
         let fan = mock.snapshot().fans[0]
         let sensorID = mock.snapshot().sensors.first!.id
         // Make the band so wide that any temp in [20, 95] maps inside [min, max].
-        mock.setMode(.sensorBased(sensorId: sensorID, lowTempC: 0, highTempC: 200), for: fan.id)
+        mock.setMode(.sensorBased(sensorId: sensorID, points: [
+            RampPoint(tempC: 0, rpm: fan.minRPM),
+            RampPoint(tempC: 200, rpm: fan.maxRPM),
+        ]), for: fan.id)
         for _ in 0..<30 { mock.refresh() }
         let final = mock.snapshot().fans.first { $0.id == fan.id }!
         if case .sensorBased = final.mode {
@@ -154,7 +157,10 @@ final class MockSMCServiceTests: XCTestCase {
         // Verifies no crash + fan RPM stays in legal range.
         let mock = MockSMCService()
         let fan = mock.snapshot().fans[0]
-        mock.setMode(.sensorBased(sensorId: "GHOST", lowTempC: 40, highTempC: 80), for: fan.id)
+        mock.setMode(.sensorBased(sensorId: "GHOST", points: [
+            RampPoint(tempC: 40, rpm: fan.minRPM),
+            RampPoint(tempC: 80, rpm: fan.maxRPM),
+        ]), for: fan.id)
         for _ in 0..<10 { mock.refresh() }
         let final = mock.snapshot().fans.first { $0.id == fan.id }!
         XCTAssertGreaterThanOrEqual(final.currentRPM, fan.minRPM)

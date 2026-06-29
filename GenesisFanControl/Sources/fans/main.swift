@@ -76,9 +76,12 @@ final class FansCLI {
         print("Target RPM : \(fan.targetRPM)")
         print("Range      : \(fan.minRPM) – \(fan.maxRPM)")
         print("Load       : \(Int(fan.loadFraction * 100))%")
-        if case .sensorBased(let sid, let low, let high) = fan.mode {
+        if case .sensorBased(let sid, let pts) = fan.mode {
             print("Sensor     : \(state.sensor(withID: sid)?.name ?? sid) (\(sid))")
-            print("Low / High : \(Int(low)) °C / \(Int(high)) °C")
+            let curve = pts.sorted(by: { $0.tempC < $1.tempC })
+                .map { "\(Int($0.tempC))°→\($0.rpm)" }
+                .joined(separator: ", ")
+            print("Ramp       : \(curve)")
         }
         return 0
     }
@@ -109,13 +112,14 @@ final class FansCLI {
             Usage:
               fans set <fanID> auto
               fans set <fanID> const <rpm>
-              fans set <fanID> sensor <sensorID> <lowC> <highC>
+              fans set <fanID> sensor <sensorID> <lowC> <highC>          (2-point ramp, lo→minRPM, hi→maxRPM)
+              fans set <fanID> ramp   <sensorID> <c1:rpm1> <c2:rpm2> ...  (N-point ramp, ≥2 points)
 
             """.utf8))
             return 64
         }
         let fanID = args[0]
-        guard state.fan(withID: fanID) != nil else {
+        guard let fan = state.fan(withID: fanID) else {
             FileHandle.standardError.write(Data("Unknown fan: \(fanID)\n".utf8))
             return 65
         }
@@ -142,9 +146,38 @@ final class FansCLI {
                 FileHandle.standardError.write(Data("Unknown sensor: \(sid)\n".utf8))
                 return 65
             }
-            mode = .sensorBased(sensorId: sid, lowTempC: low, highTempC: high)
+            mode = .sensorBased(sensorId: sid,
+                                lowTempC: low, highTempC: high,
+                                minRPM: fan.minRPM, maxRPM: fan.maxRPM)
+        case "ramp":
+            // fans set F0 ramp <sensorID> <c:rpm> <c:rpm> ...
+            guard args.count >= 5 else {
+                FileHandle.standardError.write(Data("fans set <fanID> ramp <sensorID> <c1:rpm1> <c2:rpm2> ...\n".utf8))
+                return 64
+            }
+            let sid = args[2]
+            guard state.sensor(withID: sid) != nil else {
+                FileHandle.standardError.write(Data("Unknown sensor: \(sid)\n".utf8))
+                return 65
+            }
+            var pts: [RampPoint] = []
+            for raw in args.dropFirst(3) {
+                let parts = raw.split(separator: ":").map(String.init)
+                guard parts.count == 2,
+                      let c = Double(parts[0]),
+                      let r = Int(parts[1]) else {
+                    FileHandle.standardError.write(Data("Bad point '\(raw)' — expected <tempC>:<rpm>\n".utf8))
+                    return 64
+                }
+                pts.append(RampPoint(tempC: c, rpm: r))
+            }
+            guard pts.count >= 2 else {
+                FileHandle.standardError.write(Data("ramp needs at least 2 points\n".utf8))
+                return 64
+            }
+            mode = .sensorBased(sensorId: sid, points: pts)
         default:
-            FileHandle.standardError.write(Data("Unknown mode: \(kind) (use auto|const|sensor)\n".utf8))
+            FileHandle.standardError.write(Data("Unknown mode: \(kind) (use auto|const|sensor|ramp)\n".utf8))
             return 64
         }
         state.setMode(mode, for: fanID)

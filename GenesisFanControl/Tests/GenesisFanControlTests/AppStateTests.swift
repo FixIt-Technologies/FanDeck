@@ -82,12 +82,14 @@ final class AppStateTests: XCTestCase {
               let sensorID = state.sensors.first?.id else {
             return XCTFail("Need at least one fan + one sensor")
         }
-        state.setMode(.sensorBased(sensorId: sensorID, lowTempC: 40, highTempC: 80), for: fanID)
+        let pts = [RampPoint(tempC: 40, rpm: 1200), RampPoint(tempC: 80, rpm: 5800)]
+        state.setMode(.sensorBased(sensorId: sensorID, points: pts), for: fanID)
         guard let fan = state.fan(withID: fanID) else { return XCTFail("Fan disappeared") }
-        if case .sensorBased(let sid, let lo, let hi) = fan.mode {
+        if case .sensorBased(let sid, let gotPts) = fan.mode {
             XCTAssertEqual(sid, sensorID)
-            XCTAssertEqual(lo, 40)
-            XCTAssertEqual(hi, 80)
+            XCTAssertEqual(gotPts.count, 2)
+            XCTAssertEqual(gotPts.first?.tempC, 40)
+            XCTAssertEqual(gotPts.last?.tempC, 80)
         } else {
             XCTFail("Expected .sensorBased mode, got \(fan.mode)")
         }

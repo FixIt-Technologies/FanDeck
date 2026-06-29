@@ -51,14 +51,17 @@ public final class MockSMCService: SMCService, @unchecked Sendable {
                 // Auto policy: average all CPU + GPU temps, lerp to RPM
                 let drivers = sensors.filter { $0.kind == .cpu || $0.kind == .gpu }
                 let avg = drivers.isEmpty ? 50.0 : drivers.map { $0.celsius }.reduce(0, +) / Double(drivers.count)
-                let target = rpmForTemp(avg, fan: f, low: 45, high: 85)
+                let target = rpmForTemp(avg, fan: f, points: [
+                    RampPoint(tempC: 45, rpm: f.minRPM),
+                    RampPoint(tempC: 85, rpm: f.maxRPM),
+                ])
                 stepRPM(at: i, toward: target)
             case .constant(let rpm):
                 fans[i].targetRPM = clampToFan(rpm, fan: f)
                 stepRPM(at: i, toward: fans[i].targetRPM)
-            case .sensorBased(let sensorId, let lowTempC, let highTempC):
+            case .sensorBased(let sensorId, let pts):
                 guard let temp = sensors.first(where: { $0.id == sensorId })?.celsius else { continue }
-                let target = rpmForTemp(temp, fan: f, low: lowTempC, high: highTempC)
+                let target = rpmForTemp(temp, fan: f, points: pts)
                 fans[i].targetRPM = target
                 stepRPM(at: i, toward: target)
             }
@@ -77,8 +80,9 @@ public final class MockSMCService: SMCService, @unchecked Sendable {
             fans[i].targetRPM = clamped
             fans[i].currentRPM = clamped
             Log.fans.info("Fan \(fanID) (\(fans[i].name)) -> CONSTANT \(clamped) RPM")
-        case .sensorBased(let sensorId, let lowTempC, let highTempC):
-            Log.fans.info("Fan \(fanID) (\(fans[i].name)) -> SENSOR \(sensorId) (\(Int(lowTempC))°C..\(Int(highTempC))°C)")
+        case .sensorBased(let sensorId, let pts):
+            let summary = pts.map { "\(Int($0.tempC))°→\($0.rpm)" }.joined(separator: ", ")
+            Log.fans.info("Fan \(fanID) (\(fans[i].name)) -> SENSOR \(sensorId) [\(summary)]")
         }
         return true
     }
@@ -89,10 +93,23 @@ public final class MockSMCService: SMCService, @unchecked Sendable {
         return max(fan.minRPM, min(fan.maxRPM, rpm))
     }
 
-    private func rpmForTemp(_ tempC: Double, fan: Fan, low: Double, high: Double) -> Int {
-        guard high > low else { return fan.minRPM }
-        let t = max(0, min(1, (tempC - low) / (high - low)))
-        return fan.minRPM + Int(t * Double(fan.maxRPM - fan.minRPM))
+    /// Piecewise-linear interpolation matching AppleSMCService.rpmForTemp.
+    private func rpmForTemp(_ tempC: Double, fan: Fan, points: [RampPoint]) -> Int {
+        let sorted = points.sorted(by: { $0.tempC < $1.tempC })
+        guard let first = sorted.first else { return fan.minRPM }
+        guard sorted.count >= 2 else { return clampToFan(first.rpm, fan: fan) }
+        if tempC <= first.tempC { return clampToFan(first.rpm, fan: fan) }
+        if tempC >= sorted.last!.tempC { return clampToFan(sorted.last!.rpm, fan: fan) }
+        for i in 0..<(sorted.count - 1) {
+            let a = sorted[i], b = sorted[i + 1]
+            if tempC >= a.tempC && tempC <= b.tempC {
+                let span = b.tempC - a.tempC
+                guard span > 0 else { return clampToFan(a.rpm, fan: fan) }
+                let t = (tempC - a.tempC) / span
+                return clampToFan(Int((Double(a.rpm) + t * Double(b.rpm - a.rpm)).rounded()), fan: fan)
+            }
+        }
+        return clampToFan(sorted.last!.rpm, fan: fan)
     }
 
     private func stepRPM(at i: Int, toward target: Int) {

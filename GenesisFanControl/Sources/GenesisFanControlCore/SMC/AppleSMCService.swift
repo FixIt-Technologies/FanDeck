@@ -600,9 +600,9 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             guard let fanIdx = Int(fan.id.dropFirst()) else { continue }
             let target: Int?
             switch fan.mode {
-            case .sensorBased(let sid, let lo, let hi):
+            case .sensorBased(let sid, let pts):
                 if let s = newSensors.first(where: { $0.id == sid }) {
-                    target = rpmForTemp(s.celsius, fan: fan, low: lo, high: hi)
+                    target = rpmForTemp(s.celsius, fan: fan, points: pts)
                 } else {
                     target = nil
                 }
@@ -635,10 +635,31 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         }
     }
 
-    private func rpmForTemp(_ c: Double, fan: Fan, low: Double, high: Double) -> Int {
-        guard high > low else { return fan.minRPM }
-        let t = max(0, min(1, (c - low) / (high - low)))
-        return fan.minRPM + Int(t * Double(fan.maxRPM - fan.minRPM))
+    /// Piecewise-linear interpolation over the user's ramp. Points are
+    /// sorted by tempC; outside the range, the endpoint rpm is held.
+    /// Returned rpm is clamped into the fan's [minRPM, maxRPM] envelope.
+    private func rpmForTemp(_ c: Double, fan: Fan, points: [RampPoint]) -> Int {
+        let sorted = points.sorted(by: { $0.tempC < $1.tempC })
+        guard let first = sorted.first else { return fan.minRPM }
+        guard sorted.count >= 2 else { return clampRPM(first.rpm, fan: fan) }
+        if c <= first.tempC { return clampRPM(first.rpm, fan: fan) }
+        if c >= sorted.last!.tempC { return clampRPM(sorted.last!.rpm, fan: fan) }
+        // Find the segment [a, b] enclosing c.
+        for i in 0..<(sorted.count - 1) {
+            let a = sorted[i], b = sorted[i + 1]
+            if c >= a.tempC && c <= b.tempC {
+                let span = b.tempC - a.tempC
+                guard span > 0 else { return clampRPM(a.rpm, fan: fan) }
+                let t = (c - a.tempC) / span
+                let rpm = Double(a.rpm) + t * Double(b.rpm - a.rpm)
+                return clampRPM(Int(rpm.rounded()), fan: fan)
+            }
+        }
+        return clampRPM(sorted.last!.rpm, fan: fan)
+    }
+
+    private func clampRPM(_ rpm: Int, fan: Fan) -> Int {
+        max(fan.minRPM, min(fan.maxRPM, rpm))
     }
 
     // MARK: - Virtual sensors

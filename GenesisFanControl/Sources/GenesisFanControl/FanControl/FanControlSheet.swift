@@ -21,8 +21,9 @@ struct FanControlSheet: View {
     @State private var mode: ModeChoice
     @State private var constantRPM: Double
     @State private var sensorID: String
-    @State private var lowTempC: Double
-    @State private var highTempC: Double
+    /// N-point ramp curve (N >= 2). Kept sorted-by-tempC at all times so
+    /// the chart + interpolation don't have to re-sort on every read.
+    @State private var points: [RampPoint]
 
     enum ModeChoice: String, CaseIterable, Identifiable {
         case auto, constant, sensor
@@ -47,33 +48,30 @@ struct FanControlSheet: View {
         self.fan = fan
         // Defaults for sensor-based mode when the fan is in auto/constant.
         // Lookup order: this fan's saved config → any sibling fan's saved
-        // config (so the second fan inherits from the first) → hard-coded
-        // 45/85 fallback. The picked sensor falls back to the first
-        // available aggregate / CPU sensor at the call site if "TC0E"
-        // (Intel) isn't present on Apple Silicon.
+        // config (so the second fan inherits from the first) → 2-point
+        // 45/85 fallback mapped to the fan's actual min/max RPM.
         let saved = SettingsStore.shared.sensorRampConfig(for: fan.id)
         let defaultSensor = saved?.sensorId ?? "__cpu_all_max"
-        let defaultLow = saved?.lowTempC ?? 45
-        let defaultHigh = saved?.highTempC ?? 85
+        let defaultPoints: [RampPoint] = saved?.points ?? [
+            RampPoint(tempC: 45, rpm: fan.minRPM),
+            RampPoint(tempC: 85, rpm: fan.maxRPM),
+        ]
         switch fan.mode {
         case .auto:
             self._mode = State(initialValue: .auto)
             self._constantRPM = State(initialValue: Double(fan.minRPM))
             self._sensorID = State(initialValue: defaultSensor)
-            self._lowTempC = State(initialValue: defaultLow)
-            self._highTempC = State(initialValue: defaultHigh)
+            self._points = State(initialValue: defaultPoints)
         case .constant(let rpm):
             self._mode = State(initialValue: .constant)
             self._constantRPM = State(initialValue: Double(rpm))
             self._sensorID = State(initialValue: defaultSensor)
-            self._lowTempC = State(initialValue: defaultLow)
-            self._highTempC = State(initialValue: defaultHigh)
-        case .sensorBased(let sid, let low, let high):
+            self._points = State(initialValue: defaultPoints)
+        case .sensorBased(let sid, let pts):
             self._mode = State(initialValue: .sensor)
             self._constantRPM = State(initialValue: Double(fan.minRPM))
             self._sensorID = State(initialValue: sid)
-            self._lowTempC = State(initialValue: low)
-            self._highTempC = State(initialValue: high)
+            self._points = State(initialValue: pts.sorted(by: { $0.tempC < $1.tempC }))
         }
     }
 
@@ -218,39 +216,129 @@ struct FanControlSheet: View {
                     Spacer()
                 }
 
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Start ramping at:")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.gfcText)
-                        Spacer()
-                        StepperRow(value: $lowTempC, range: 0...120, step: 1, suffix: "°C")
-                    }
-                    NeonSlider(
-                        value: $lowTempC,
-                        range: 20...100,
-                        accent: .gfcGreen,
-                        trailing: { String(format: "%.0f °C", $0) }
-                    )
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Reach full speed at:")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.gfcText)
-                        Spacer()
-                        StepperRow(value: $highTempC, range: 0...120, step: 1, suffix: "°C")
-                    }
-                    NeonSlider(
-                        value: $highTempC,
-                        range: 20...110,
-                        accent: .gfcRed,
-                        trailing: { String(format: "%.0f °C", $0) }
-                    )
-                }
+                pointsEditor
             }
         }
+    }
+
+    /// Compact list of ramp vertices — one row per point with both
+    /// temp (°C) and rpm steppers + delete button (disabled when N <= 2).
+    /// "Add point" appends a new vertex halfway between the last two and
+    /// re-sorts. The Chart in livePreviewCard renders the same array
+    /// with draggable handles, so the user can edit either way.
+    private var pointsEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Ramp points")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.gfcText)
+                Spacer()
+                Button {
+                    addPoint()
+                } label: {
+                    Label("Add point", systemImage: "plus.circle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.borderless)
+                .foregroundColor(.gfcCyan)
+            }
+            ForEach(points.indices, id: \.self) { i in
+                pointRow(index: i)
+            }
+            Text("Drag the dots on the graph below to reshape the curve, or edit values here.")
+                .font(.system(size: 10))
+                .foregroundColor(.gfcTextMuted)
+        }
+    }
+
+    @ViewBuilder
+    private func pointRow(index i: Int) -> some View {
+        let binding = pointBinding(at: i)
+        HStack(spacing: 8) {
+            Circle()
+                .fill(pointColor(at: i))
+                .frame(width: 10, height: 10)
+                .shadow(color: pointColor(at: i).opacity(0.7), radius: 3)
+            // Temp stepper
+            HStack(spacing: 2) {
+                Text("at")
+                    .font(.system(size: 11))
+                    .foregroundColor(.gfcTextMuted)
+                Stepper(value: binding.tempC, in: 0...120, step: 1) {
+                    Text("\(Int(points[i].tempC)) °C")
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.gfcText)
+                        .frame(minWidth: 56, alignment: .trailing)
+                }
+                .labelsHidden()
+            }
+            Text("→")
+                .font(.system(size: 11))
+                .foregroundColor(.gfcTextMuted)
+            // RPM stepper (step 50 RPM)
+            Stepper(value: binding.rpm,
+                    in: fan.minRPM...fan.maxRPM,
+                    step: 50) {
+                Text("\(points[i].rpm) RPM")
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.gfcText)
+                    .frame(minWidth: 80, alignment: .trailing)
+            }
+            .labelsHidden()
+            Spacer()
+            Button {
+                deletePoint(at: i)
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 11))
+                    .foregroundColor(points.count > 2 ? .gfcRed : .gfcTextMuted.opacity(0.3))
+            }
+            .buttonStyle(.plain)
+            .disabled(points.count <= 2)
+            .help(points.count > 2 ? "Delete this point" : "Need at least 2 points")
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func pointBinding(at i: Int) -> (tempC: Binding<Double>, rpm: Binding<Int>) {
+        let temp = Binding<Double>(
+            get: { points[safe: i]?.tempC ?? 0 },
+            set: { newVal in
+                guard i < points.count else { return }
+                points[i].tempC = newVal
+                points.sort(by: { $0.tempC < $1.tempC })
+            }
+        )
+        let rpm = Binding<Int>(
+            get: { points[safe: i]?.rpm ?? fan.minRPM },
+            set: { newVal in
+                guard i < points.count else { return }
+                points[i].rpm = max(fan.minRPM, min(fan.maxRPM, newVal))
+            }
+        )
+        return (temp, rpm)
+    }
+
+    private func pointColor(at i: Int) -> Color {
+        if i == 0 { return .gfcGreen }
+        if i == points.count - 1 { return .gfcRed }
+        return .gfcCyan
+    }
+
+    private func addPoint() {
+        let last = points.last ?? RampPoint(tempC: 85, rpm: fan.maxRPM)
+        let prev = points.dropLast().last ?? RampPoint(tempC: 45, rpm: fan.minRPM)
+        let mid = RampPoint(
+            tempC: (prev.tempC + last.tempC) / 2,
+            rpm: (prev.rpm + last.rpm) / 2
+        )
+        points.append(mid)
+        points.sort(by: { $0.tempC < $1.tempC })
+    }
+
+    private func deletePoint(at i: Int) {
+        guard points.count > 2, i < points.count else { return }
+        points.remove(at: i)
     }
 
     // MARK: - Live preview
@@ -279,22 +367,23 @@ struct FanControlSheet: View {
 
     private var rampGraph: some View {
         let live = appState.sensor(withID: sensorID)
-        let currentTemp = live?.celsius ?? lowTempC
+        let currentTemp = live?.celsius ?? points.first?.tempC ?? 45
         let projected = computedTargetRPM()
-        let xMin = max(0.0, min(lowTempC - 10, 20))
-        let xMax = max(highTempC + 10, 110)
-
-        // Anchor points of the piecewise-linear ramp: clamp before low,
-        // ramp between low and high, clamp after high.
-        let curve: [(temp: Double, rpm: Int)] = [
-            (xMin,        fan.minRPM),
-            (lowTempC,    fan.minRPM),
-            (highTempC,   fan.maxRPM),
-            (xMax,        fan.maxRPM),
-        ]
+        // X-axis: pad 10° on each side of the extreme points, but never
+        // narrower than 20…110 so the chart breathes.
+        let lo = points.first?.tempC ?? 45
+        let hi = points.last?.tempC ?? 85
+        let xMin = max(0.0, min(lo - 10, 20))
+        let xMax = max(hi + 10, 110)
+        // Build a clamped curve: hold first.rpm before first.tempC,
+        // interpolate between points, hold last.rpm after last.tempC.
+        var curve: [(temp: Double, rpm: Int)] = []
+        if let first = points.first { curve.append((xMin, first.rpm)) }
+        for p in points { curve.append((p.tempC, p.rpm)) }
+        if let last = points.last { curve.append((xMax, last.rpm)) }
 
         return Chart {
-            // Filled area under the ramp for visual mass
+            // Filled area under the ramp
             ForEach(curve.indices, id: \.self) { i in
                 AreaMark(
                     x: .value("Temp", curve[i].temp),
@@ -302,7 +391,7 @@ struct FanControlSheet: View {
                 )
                 .foregroundStyle(
                     LinearGradient(
-                        colors: [Color.gfcCyan.opacity(0.45), Color.gfcCyan.opacity(0.05)],
+                        colors: [Color.gfcCyan.opacity(0.40), Color.gfcCyan.opacity(0.04)],
                         startPoint: .top, endPoint: .bottom
                     )
                 )
@@ -318,30 +407,7 @@ struct FanControlSheet: View {
                 .lineStyle(StrokeStyle(lineWidth: 2))
                 .interpolationMethod(.linear)
             }
-            // Anchor handles — the two user-controllable thresholds
-            PointMark(
-                x: .value("Temp", lowTempC),
-                y: .value("RPM", fan.minRPM)
-            )
-            .foregroundStyle(Color.gfcGreen)
-            .symbolSize(80)
-            .annotation(position: .top, alignment: .center) {
-                Text("\(Int(lowTempC))°")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(.gfcGreen)
-            }
-            PointMark(
-                x: .value("Temp", highTempC),
-                y: .value("RPM", fan.maxRPM)
-            )
-            .foregroundStyle(Color.gfcRed)
-            .symbolSize(80)
-            .annotation(position: .top, alignment: .center) {
-                Text("\(Int(highTempC))°")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(.gfcRed)
-            }
-            // Live cursor — current temp on the curve.
+            // Live cursor — current temp on the curve
             RuleMark(x: .value("Now", currentTemp))
                 .foregroundStyle(Color.gfcAmber.opacity(0.35))
                 .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
@@ -350,7 +416,7 @@ struct FanControlSheet: View {
                 y: .value("RPM", projected)
             )
             .foregroundStyle(Color.gfcAmber)
-            .symbolSize(140)
+            .symbolSize(110)
             .annotation(position: .topTrailing, alignment: .leading, spacing: 4) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(String(format: "%.1f °C", currentTemp))
@@ -393,7 +459,102 @@ struct FanControlSheet: View {
                 }
             }
         }
-        .frame(height: 160)
+        .chartOverlay { proxy in
+            GeometryReader { geo in
+                if let plot = proxy.plotFrame {
+                    let frame = geo[plot]
+                    ZStack {
+                        // Background tap-area: double-click on empty space
+                        // anywhere in the plot adds a new ramp point at
+                        // that (tempC, rpm).
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture(count: 2) { loc in
+                                addPointAt(location: loc, proxy: proxy, frame: frame, xMin: xMin, xMax: xMax)
+                            }
+                        ForEach(points.indices, id: \.self) { i in
+                            handle(at: i, proxy: proxy, frame: frame, xMin: xMin, xMax: xMax)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(height: 180)
+    }
+
+    @ViewBuilder
+    private func handle(at i: Int, proxy: ChartProxy, frame: CGRect,
+                        xMin: Double, xMax: Double) -> some View {
+        let p = points[safe: i] ?? RampPoint(tempC: 0, rpm: 0)
+        if let posX = proxy.position(forX: p.tempC),
+           let posY = proxy.position(forY: p.rpm) {
+            let cx = posX + frame.minX
+            let cy = posY + frame.minY
+            let isFirst = (i == 0)
+            let isLast = (i == points.count - 1)
+            let color: Color = isFirst ? .gfcGreen : (isLast ? .gfcRed : .gfcCyan)
+
+            ZStack {
+                Circle()
+                    .fill(color.opacity(0.25))
+                    .frame(width: 26, height: 26)
+                Circle()
+                    .fill(color)
+                    .frame(width: 14, height: 14)
+                    .shadow(color: color.opacity(0.85), radius: 4)
+            }
+            .position(x: cx, y: cy)
+            .contentShape(Circle().path(in: CGRect(x: -8, y: -8, width: 32, height: 32)))
+            .gesture(dragGesture(forPointAt: i, proxy: proxy, frame: frame, xMin: xMin, xMax: xMax))
+            .contextMenu {
+                if points.count > 2 {
+                    Button(role: .destructive) {
+                        deletePoint(at: i)
+                    } label: {
+                        Label("Delete point", systemImage: "trash")
+                    }
+                }
+            }
+        }
+    }
+
+    private func dragGesture(forPointAt i: Int, proxy: ChartProxy, frame: CGRect,
+                             xMin: Double, xMax: Double) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { drag in
+                guard i < points.count else { return }
+                let inChartX = drag.location.x - frame.minX
+                let inChartY = drag.location.y - frame.minY
+                if let tempC: Double = proxy.value(atX: inChartX, as: Double.self),
+                   let rpm: Int = proxy.value(atY: inChartY, as: Int.self) {
+                    var newT = max(0, min(120, tempC))
+                    // Prevent dragging past neighbors — keeps the curve
+                    // monotonically progressing left-to-right so the line
+                    // doesn't kink visually.
+                    if i > 0 {
+                        newT = max(newT, points[i - 1].tempC + 1)
+                    }
+                    if i < points.count - 1 {
+                        newT = min(newT, points[i + 1].tempC - 1)
+                    }
+                    points[i].tempC = newT
+                    points[i].rpm = max(fan.minRPM, min(fan.maxRPM, rpm))
+                }
+            }
+    }
+
+    private func addPointAt(location: CGPoint, proxy: ChartProxy, frame: CGRect,
+                            xMin: Double, xMax: Double) {
+        let inChartX = location.x - frame.minX
+        let inChartY = location.y - frame.minY
+        guard let tempC: Double = proxy.value(atX: inChartX, as: Double.self),
+              let rpm: Int = proxy.value(atY: inChartY, as: Int.self) else { return }
+        let newPoint = RampPoint(
+            tempC: max(0, min(120, tempC)),
+            rpm: max(fan.minRPM, min(fan.maxRPM, rpm))
+        )
+        points.append(newPoint)
+        points.sort(by: { $0.tempC < $1.tempC })
     }
 
     // MARK: - Footer (Cancel / Apply)
@@ -415,10 +576,9 @@ struct FanControlSheet: View {
                 // touched it — even if the active mode they're applying is
                 // constant or auto. That way switching back to sensor-based
                 // later restores exactly what they had configured.
+                let sortedPts = points.sorted(by: { $0.tempC < $1.tempC })
                 settings.saveSensorRampConfig(
-                    SensorRampConfig(sensorId: sensorID,
-                                     lowTempC: lowTempC,
-                                     highTempC: highTempC),
+                    SensorRampConfig(sensorId: sensorID, points: sortedPts),
                     for: fan.id)
                 appState.setMode(applyMode(), for: fan.id)
                 dismiss()
@@ -438,11 +598,8 @@ struct FanControlSheet: View {
         case .auto: return .auto
         case .constant: return .constant(rpm: Int(constantRPM.rounded()))
         case .sensor:
-            return .sensorBased(
-                sensorId: sensorID,
-                lowTempC: lowTempC,
-                highTempC: max(highTempC, lowTempC + 1)
-            )
+            let pts = points.sorted(by: { $0.tempC < $1.tempC })
+            return .sensorBased(sensorId: sensorID, points: pts)
         }
     }
 
@@ -457,12 +614,44 @@ struct FanControlSheet: View {
             return fan.currentRPM
         case .constant(let rpm):
             return rpm
-        case .sensorBased(let sid, let low, let high):
+        case .sensorBased(let sid, let pts):
             let temp = appState.sensor(withID: sid)?.celsius ?? 0
-            guard high > low else { return fan.minRPM }
-            let t = max(0, min(1, (temp - low) / (high - low)))
-            return fan.minRPM + Int(t * Double(fan.maxRPM - fan.minRPM))
+            return interpolate(tempC: temp, points: pts)
         }
+    }
+
+    /// Mirror of AppleSMCService.rpmForTemp(_:fan:points:) — duplicated
+    /// here so the live preview doesn't depend on the SMC service. Same
+    /// piecewise-linear semantics: clamp outside the endpoints, lerp
+    /// between consecutive points, clamp into [fan.minRPM, fan.maxRPM].
+    private func interpolate(tempC c: Double, points: [RampPoint]) -> Int {
+        let sorted = points.sorted(by: { $0.tempC < $1.tempC })
+        guard let first = sorted.first else { return fan.minRPM }
+        guard sorted.count >= 2 else { return clamped(first.rpm) }
+        if c <= first.tempC { return clamped(first.rpm) }
+        if c >= sorted.last!.tempC { return clamped(sorted.last!.rpm) }
+        for i in 0..<(sorted.count - 1) {
+            let a = sorted[i], b = sorted[i + 1]
+            if c >= a.tempC && c <= b.tempC {
+                let span = b.tempC - a.tempC
+                guard span > 0 else { return clamped(a.rpm) }
+                let t = (c - a.tempC) / span
+                return clamped(Int((Double(a.rpm) + t * Double(b.rpm - a.rpm)).rounded()))
+            }
+        }
+        return clamped(sorted.last!.rpm)
+    }
+
+    private func clamped(_ rpm: Int) -> Int {
+        max(fan.minRPM, min(fan.maxRPM, rpm))
+    }
+}
+
+// MARK: - Array safe subscript
+
+private extension Array {
+    subscript(safe i: Int) -> Element? {
+        return indices.contains(i) ? self[i] : nil
     }
 }
 
@@ -545,7 +734,11 @@ private struct StepperRow: View {
 #Preview {
     FanControlSheet(fan: Fan(id: "F0", name: "Left side", minRPM: 1200, maxRPM: 5800,
                              currentRPM: 2400, targetRPM: 2400,
-                             mode: .sensorBased(sensorId: "TC0E", lowTempC: 45, highTempC: 80)))
+                             mode: .sensorBased(sensorId: "TC0E", points: [
+                                 RampPoint(tempC: 45, rpm: 1200),
+                                 RampPoint(tempC: 65, rpm: 3000),
+                                 RampPoint(tempC: 80, rpm: 5800),
+                             ])))
         .environmentObject(AppState.shared)
         .environmentObject(SettingsStore.shared)
 }

@@ -159,7 +159,11 @@ final class SMCModelsTests: XCTestCase {
     }
 
     func testFanModeSensorBasedCodableRoundTrip() throws {
-        let original = FanMode.sensorBased(sensorId: "TC0E", lowTempC: 45.0, highTempC: 85.0)
+        let original = FanMode.sensorBased(sensorId: "TC0E", points: [
+            RampPoint(tempC: 45, rpm: 1200),
+            RampPoint(tempC: 60, rpm: 3000),
+            RampPoint(tempC: 85, rpm: 5800),
+        ])
         let data = try JSONEncoder().encode(original)
         let decoded = try JSONDecoder().decode(FanMode.self, from: data)
         XCTAssertEqual(decoded, original)
@@ -168,7 +172,9 @@ final class SMCModelsTests: XCTestCase {
     func testFanModeDisplayNames() {
         XCTAssertEqual(FanMode.auto.displayName, "Automatic (OS-managed)")
         XCTAssertEqual(FanMode.constant(rpm: 1000).displayName, "Constant speed")
-        XCTAssertEqual(FanMode.sensorBased(sensorId: "x", lowTempC: 1, highTempC: 2).displayName, "Sensor-based")
+        XCTAssertEqual(FanMode.sensorBased(sensorId: "x", points: [
+            RampPoint(tempC: 1, rpm: 1000), RampPoint(tempC: 2, rpm: 5000),
+        ]).displayName, "Sensor-based")
     }
 
     // MARK: - Helpers

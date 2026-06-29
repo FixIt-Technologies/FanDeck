@@ -11,19 +11,36 @@ import Foundation
 import Combine
 
 /// Persisted sensor-based fan config per fanID. Lets us restore the
-/// user's chosen sensor + thresholds when they switch a fan to constant
-/// or auto and later back to sensor-based, and lets a fresh fan inherit
+/// user's chosen sensor + ramp when they switch a fan to constant or
+/// auto and later back to sensor-based, and lets a fresh fan inherit
 /// from a sibling that already has a config.
+///
+/// The ramp is N points (N >= 2), piecewise-linear. The old two-point
+/// `(lowTempC, highTempC)` form is still accepted via the convenience
+/// initializer that turns it into `[(low, minRPM), (high, maxRPM)]`.
 public struct SensorRampConfig: Codable, Equatable, Sendable {
     public var sensorId: String
-    public var lowTempC: Double
-    public var highTempC: Double
+    public var points: [RampPoint]
 
-    public init(sensorId: String, lowTempC: Double, highTempC: Double) {
+    public init(sensorId: String, points: [RampPoint]) {
         self.sensorId = sensorId
-        self.lowTempC = lowTempC
-        self.highTempC = highTempC
+        self.points = points
     }
+
+    /// Convenience for callers using the old (low, high) shape. Builds
+    /// `[(low, minRPM), (high, maxRPM)]`. Pass the fan's min/max so the
+    /// ramp endpoints map to real RPMs.
+    public init(sensorId: String, lowTempC: Double, highTempC: Double,
+                minRPM: Int, maxRPM: Int) {
+        self.sensorId = sensorId
+        self.points = [
+            RampPoint(tempC: lowTempC, rpm: minRPM),
+            RampPoint(tempC: highTempC, rpm: maxRPM),
+        ]
+    }
+
+    public var lowTempC: Double { points.first?.tempC ?? 45 }
+    public var highTempC: Double { points.last?.tempC ?? 85 }
 }
 
 public enum MenuBarIconStyle: String, Codable, CaseIterable, Identifiable, Sendable {

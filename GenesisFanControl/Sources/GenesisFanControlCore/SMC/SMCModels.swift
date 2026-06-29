@@ -66,10 +66,26 @@ public struct TempSensor: Identifiable, Hashable, Codable, Sendable {
 
 // MARK: - Fan
 
+/// One vertex of a piecewise-linear fan ramp. The full ramp is
+/// `[(t0, r0), (t1, r1), …]` sorted by `tempC`. Sensor reading below
+/// the first temp clamps to its rpm; above the last clamps to its rpm;
+/// between two consecutive points we linearly interpolate.
+public struct RampPoint: Codable, Hashable, Sendable {
+    public var tempC: Double
+    public var rpm: Int
+
+    public init(tempC: Double, rpm: Int) {
+        self.tempC = tempC
+        self.rpm = rpm
+    }
+}
+
 public enum FanMode: Codable, Hashable, Sendable {
     case auto
     case constant(rpm: Int)
-    case sensorBased(sensorId: String, lowTempC: Double, highTempC: Double)
+    /// N-point piecewise-linear ramp from `points` driven by `sensorId`'s
+    /// live reading. At least 2 points required; UI should enforce this.
+    case sensorBased(sensorId: String, points: [RampPoint])
 
     public var displayName: String {
         switch self {
@@ -77,6 +93,18 @@ public enum FanMode: Codable, Hashable, Sendable {
         case .constant: return "Constant speed"
         case .sensorBased: return "Sensor-based"
         }
+    }
+}
+
+/// Convenience for callers that still think in two-point (low, high)
+/// terms — e.g. older CLI invocations or migrations. Builds a 2-point
+/// ramp at `(low → minRPM)` and `(high → maxRPM)`.
+public extension FanMode {
+    static func sensorBased(sensorId: String, lowTempC: Double, highTempC: Double,
+                            minRPM: Int, maxRPM: Int) -> FanMode {
+        let lo = RampPoint(tempC: lowTempC, rpm: minRPM)
+        let hi = RampPoint(tempC: highTempC, rpm: maxRPM)
+        return .sensorBased(sensorId: sensorId, points: [lo, hi])
     }
 }
 
