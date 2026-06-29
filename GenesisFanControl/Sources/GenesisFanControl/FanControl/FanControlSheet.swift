@@ -171,24 +171,44 @@ struct FanControlSheet: View {
                     Text("Sensor:")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(.gfcText)
-                    Picker("", selection: $sensorID) {
+                    // Menu (not Picker) — macOS Picker's pop-up renders each
+                    // entry through NSMenuItem.title (plain text), so any
+                    // HStack/Spacer/secondary Text inside the ForEach gets
+                    // collapsed to the leading label only. Menu+Button keeps
+                    // the SwiftUI hierarchy intact so we can show the live
+                    // temperature on the right of each row.
+                    Menu {
                         ForEach(appState.sensors) { s in
-                            // Trailing temp is right-padded inside the label
-                            // string itself because macOS Pickers (menu style)
-                            // don't honor Spacer() across menu items.
-                            let temp = s.formatted(useFahrenheit: settings.useFahrenheit, precise: false)
-                            HStack(spacing: 8) {
-                                Image(systemName: s.kind.sfSymbol)
-                                Text(s.name)
+                            Button {
+                                sensorID = s.id
+                            } label: {
+                                let temp = s.formatted(useFahrenheit: settings.useFahrenheit, precise: false)
+                                HStack(spacing: 8) {
+                                    Image(systemName: s.kind.sfSymbol)
+                                    Text(s.name)
+                                    Spacer(minLength: 12)
+                                    Text(temp)
+                                        .monospacedDigit()
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if let cur = appState.sensor(withID: sensorID) {
+                                Image(systemName: cur.kind.sfSymbol)
+                                Text(cur.name)
                                 Spacer(minLength: 12)
-                                Text(temp)
+                                Text(cur.formatted(useFahrenheit: settings.useFahrenheit, precise: false))
                                     .monospacedDigit()
                                     .foregroundColor(.secondary)
+                            } else {
+                                Text("Choose sensor…").foregroundColor(.secondary)
                             }
-                            .tag(s.id)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .labelsHidden()
+                    .menuStyle(.borderlessButton)
                     .frame(maxWidth: 360)
                     Spacer()
                 }
