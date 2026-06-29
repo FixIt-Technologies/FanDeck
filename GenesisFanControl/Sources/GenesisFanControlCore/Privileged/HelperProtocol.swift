@@ -27,7 +27,12 @@ public enum HelperConstants {
     /// v3 (2026-06-30): cred-check on accept, 0660 socket, locked-fan
     /// tracking + SIGTERM revert, idle watchdog. Old v2 helper has no
     /// safety net for a crashed GUI; everyone should upgrade.
-    public static let protocolVersion = 3
+    /// v4 (2026-06-30): canonical AUTO release — drop F0Md=0 readback
+    /// retry (mode 0 is transient on AS, never stably reads back),
+    /// classify md==3 as auto (firmware-System resting state), settle
+    /// window after release. The old helper still does the readback
+    /// retry which fails on every M-series Mac — must upgrade.
+    public static let protocolVersion = 4
 }
 
 public enum HelperRequest: Codable {

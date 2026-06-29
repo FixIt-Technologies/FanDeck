@@ -319,41 +319,43 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         }
     }
 
-    /// AUTO release with the "Ftst is global" invariant respected and
-    /// READBACK VERIFICATION — writing F0Md=0 returns kSMCSuccess even
-    /// when the firmware silently rejects the write, so we read the key
-    /// back and retry until it actually flips (or give up after a few
-    /// attempts and surface to the caller, which then falls back to the
-    /// helper). This closes the "click AUTO → blinks back to CONSTANT"
-    /// bug that the order-fix alone didn't fully resolve.
+    /// Canonical Apple Silicon AUTO release — cross-validated against
+    /// exelban/stats, agoodkind/macos-smc-fan, leaperone/smctl. The
+    /// firmware-resting state for an auto fan is F{i}Md == 3 (System,
+    /// owned by thermalmonitord/AppleCLPC), NOT 0. Mode 0 is a
+    /// transient unlock-dance value that never stably reads back.
+    /// Therefore:
+    ///   1. F{i}Md = 0 is hygiene — issue once, do NOT readback-verify
+    ///      (the readback may legitimately settle to 3, not 0).
+    ///   2. Ftst = 0 is the load-bearing write. It releases the global
+    ///      veto on thermalmonitord's reclaim loop. The daemon then
+    ///      repolls within ~250ms (thermal load) to ~4s (idle) and
+    ///      settles F{i}Md back to 3.
+    ///   3. Only lower Ftst when EVERY other fan is also auto — the
+    ///      "Ftst is global" invariant. Otherwise constants on other
+    ///      fans get silently re-locked by the firmware (review
+    ///      finding "Ftst is global, treated as per-fan").
+    /// See [[2026-06-30-Canonical-Auto-Release-Synthesis]] for the
+    /// research that informed this rewrite.
     private func autoReleaseDirect(fanIdx: Int, r: UInt32) -> Bool {
         let mKey = modeKey(forFan: fanIdx)
-        Log.fans.debug("autoReleaseDirect r=\(r) fan=F\(fanIdx) key=\(mKey) — initial md=\(readDouble(mKey) ?? -1) ftst=\(readDouble("Ftst") ?? -1)")
+        let initMd = readDouble(mKey) ?? -1
+        let initFtst = readDouble("Ftst") ?? -1
+        Log.fans.debug("autoReleaseDirect r=\(r) fan=F\(fanIdx) key=\(mKey) — initial md=\(initMd) ftst=\(initFtst)")
 
-        // Write F0Md=0, then VERIFY by reading back. The firmware
-        // sometimes acks the write but doesn't actually flip the bit
-        // — readback is the only way to know we genuinely succeeded.
-        var success = false
-        for attempt in 1...5 {
-            let wrote = writeUInt8(key: mKey, value: 0)
-            // 20ms settle before reading — flash propagation isn't
-            // instantaneous on every chip.
-            usleep(20_000)
-            let readback = readDouble(mKey) ?? -1
-            Log.fans.debug("autoReleaseDirect r=\(r) fan=F\(fanIdx) attempt=\(attempt) write=\(wrote) readback=\(readback)")
-            if wrote && readback < 0.5 {
-                success = true
-                break
-            }
-            // Brief backoff before retry.
-            usleep(50_000)
+        // 1. Hygiene write: mode → 0. No readback — on Apple Silicon
+        //    this value is transient; it will settle to 3 once Ftst
+        //    drops and thermalmonitord reclaims. Failure is logged
+        //    but non-fatal; the Ftst=0 below is what actually matters.
+        let modeWrote = writeUInt8(key: mKey, value: 0)
+        if !modeWrote {
+            Log.fans.debug("autoReleaseDirect r=\(r) fan=F\(fanIdx) \(mKey)=0 write rejected — continuing anyway (Ftst=0 is the load-bearing op)")
         }
-        guard success else {
-            Log.fans.error("autoReleaseDirect r=\(r) fan=F\(fanIdx) GAVE UP — \(mKey) didn't flip to 0 after 5 attempts (firmware ignoring; will fall through to helper)")
-            return false
-        }
-        Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) \(mKey)=0 confirmed")
 
+        // 2. Ftst gate: only drop the global lock when no other fan is
+        //    still user-forced. If any other fan is in .constant or
+        //    .sensorBased, leaving Ftst=1 keeps thermalmonitord
+        //    inhibited so they stay where the user pinned them.
         let othersStillConstant = cachedFans.contains { other in
             guard let oi = Int(other.id.dropFirst()), oi != fanIdx else { return false }
             switch other.mode {
@@ -362,22 +364,32 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             }
         }
         if othersStillConstant {
-            Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) keeping Ftst=1 — other fans still non-auto")
+            Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) keeping Ftst=1 — other fans still non-auto; this fan will read md=1 until siblings release")
             return true
         }
-        // Last non-auto fan going home — safe to lower the global lock.
+
+        // 3. Last non-auto fan going home — release the global veto.
+        //    Single attempt, no readback (matches agoodkind's
+        //    resetFanControl() and Stats's writeWithRetry pattern).
+        //    The firmware's next thermalmonitord poll (~250ms–4s) will
+        //    flip F{i}Md from 1 to 3, and primeSnapshot's md==1
+        //    classifier maps 3 → .auto so the UI won't flicker.
         let ftstOk = writeUInt8(key: "Ftst", value: 0)
-        let ftstReadback = readDouble("Ftst") ?? -1
-        if !ftstOk || ftstReadback >= 0.5 {
-            // Direct Ftst write may legitimately fail (firmware bounce) —
-            // F0Md=0 is the load-bearing write; Ftst will naturally
-            // drift back to 0 on next firmware re-arm. Not fatal.
-            Log.fans.warning("autoReleaseDirect r=\(r) fan=F\(fanIdx) F0Md=0 ok but Ftst=0 was refused (wrote=\(ftstOk) readback=\(ftstReadback)) — not fatal")
-        } else {
-            Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) Ftst=0 confirmed (last non-auto fan home)")
-        }
+        Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) Ftst=0 wrote=\(ftstOk) (last non-auto fan home; expecting md=3 within ~4s)")
+        // Stamp the release time so primeSnapshot can guard against
+        // the in-between window where md transitions 1 → 3 and any
+        // observer reading the SMC straight after our write might still
+        // see md=1. See lastReleaseAt usage in primeSnapshot.
+        lastReleaseAt[fanIdx] = Date()
         return true
     }
+
+    /// Per-fan timestamp of the most recent autoReleaseDirect call.
+    /// primeSnapshot consults this to hold the UI in .auto for ~4.5s
+    /// after release — the worst-case thermalmonitord repoll window.
+    /// Without this hold, a snapshot landing in the brief md=1→3
+    /// transition would briefly flash .constant in the UI.
+    private var lastReleaseAt: [Int: Date] = [:]
 
     /// Floor used when we have to ask the helper to enter constant mode
     /// before sensor-based takes over driving — we don't want to spike
@@ -715,12 +727,35 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             let md     = readDouble(modeKey(forFan: i)) ?? 0
 
             let existing = cachedFans.first(where: { $0.id == "F\(i)" })
-            let baseMode: FanMode
-            if md >= 1 {
-                baseMode = .constant(rpm: Int(target))
-            } else {
-                baseMode = .auto
-            }
+            // Apple-Silicon mode-key semantics (cross-validated against
+            // exelban/stats, agoodkind/macos-smc-fan, leaperone/smctl):
+            //   0 = auto (transient state during unlock dance)
+            //   1 = user-forced (we wrote F0Md=1 + Ftst=1)
+            //   3 = "System" — thermalmonitord/AppleCLPC are actively
+            //       managing the fan. This IS the firmware-resting auto
+            //       state on M1–M4; reading md=3 means our AUTO release
+            //       succeeded and the system has taken back control.
+            // Bug we were hitting: treating `md >= 1` as constant lumped
+            // 1 (forced) and 3 (system) into the same bucket, so a
+            // successful AUTO release → firmware reclaim → next snapshot
+            // reads md=3 → UI flips back to CONSTANT and the gauge looks
+            // like the AUTO click "didn't take". Fix: ONLY md == 1 is
+            // user-forced; everything else (0, 3, and any future state)
+            // is firmware-managed and presented as .auto.
+            // Settle window: for ~4.5s after autoReleaseDirect, treat
+            // any md value as .auto. Thermalmonitord's reclaim poll can
+            // take up to 4s under idle load, and during the transition
+            // md may briefly still read 1 before settling to 3. Without
+            // this hold, a snapshot landing in that window would flicker
+            // the UI to .constant. Matches Stats's implicit 1–3s settle
+            // via slow sensor polling.
+            let inReleaseSettle: Bool = {
+                guard let t = lastReleaseAt[i] else { return false }
+                return Date().timeIntervalSince(t) < 4.5
+            }()
+            let baseMode: FanMode = (md == 1 && !inReleaseSettle)
+                ? .constant(rpm: Int(target))
+                : .auto
             // Preserve host-driven modes — SMC doesn't reliably report
             // them back to us:
             //  • .sensorBased: SMC has no concept of it, so we keep ours.
@@ -730,27 +765,21 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             //    we last wrote, not the firmware's claw-back. The host
             //    loop at the bottom of this method re-asserts the write
             //    on every tick so the physical fan stays where we put it.
+            // Note: the `md == 1` gate matches baseMode's classification —
+            // a firmware-System (md=3) readback is NOT user-forced and
+            // must fall through to baseMode (.auto) regardless of what
+            // the prior cached mode said.
             let mode: FanMode
             let displayedTarget: Int
             if case .sensorBased = existing?.mode {
                 mode = existing!.mode
                 displayedTarget = existing?.targetRPM ?? Int(target)
-            } else if case .constant(let cachedRPM) = existing?.mode, md >= 1 {
+            } else if case .constant(let cachedRPM) = existing?.mode, md == 1, !inReleaseSettle {
                 mode = .constant(rpm: cachedRPM)
                 displayedTarget = cachedRPM
             } else {
                 mode = baseMode
                 displayedTarget = Int(target)
-                // Loud canary: cached said AUTO, but SMC says md>=1 →
-                // the firmware did not actually accept the AUTO write
-                // (this is the "blink and back to old setting" bug
-                // surfacing in the readback). The retry in
-                // autoReleaseDirect should have caught it; if we get
-                // here anyway, either the helper succeeded but firmware
-                // reverted, or thermalmonitord re-engaged immediately.
-                if case .auto = existing?.mode, md >= 1 {
-                    Log.fans.warning("primeSnapshot fan=F\(i) anomaly — cached=.auto but SMC \(modeKey(forFan: i))=\(md). Firmware re-locked after AUTO write?")
-                }
             }
             Log.fans.debug("primeSnapshot fan=F\(i) actual=\(Int(actual)) target=\(Int(target)) md=\(md) → mode=\(modeDescription(mode)) displayedTarget=\(displayedTarget)")
 
