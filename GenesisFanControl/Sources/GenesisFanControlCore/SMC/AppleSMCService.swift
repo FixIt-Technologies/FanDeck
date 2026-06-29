@@ -224,11 +224,39 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             Log.fans.error("Fan \(fanID) CONSTANT \(rpm): direct + helper both failed")
             return false
         case .sensorBased:
-            updateCachedMode(for: fanID, to: mode)
-            Log.fans.info("Fan \(fanID) -> SENSOR-BASED (host-driven)")
-            return true
+            // Sensor-based is host-driven (we compute the target RPM from
+            // the chosen sensor each poll tick), but the SMC itself still
+            // needs to be in CONSTANT (F0Md=1, Ftst unlocked) so the per-
+            // tick writeRPM in primeSnapshot() actually moves the fan.
+            // Without this, F0Md stayed at 0 (auto) and the firmware
+            // ignored every F0Tg write — fan sat at its idle floor.
+            if unlockFanControl(fanIdx: idx) {
+                updateCachedMode(for: fanID, to: mode)
+                Log.fans.info("Fan \(fanID) -> SENSOR-BASED (host-driven, unlocked direct)")
+                return true
+            }
+            if helperClient.setMode(.constant(rpm: cachedFans.first(where: { $0.id == fanID })?.targetRPM ?? minSafeRPM(forFan: idx)),
+                                    for: fanID) {
+                // Helper successfully put us in constant. Switch cached
+                // mode to sensorBased (host loop will drive target).
+                updateCachedMode(for: fanID, to: mode)
+                Log.fans.info("Fan \(fanID) -> SENSOR-BASED (host-driven, via helper)")
+                return true
+            }
+            Log.fans.error("Fan \(fanID) SENSOR-BASED: failed to unlock fan control (direct + helper)")
+            return false
         }
     }
+
+    /// Floor used when we have to ask the helper to enter constant mode
+    /// before sensor-based takes over driving — we don't want to spike
+    /// the fan during the brief moment between the helper write and the
+    /// next poll-tick target push.
+    private func minSafeRPM(forFan idx: Int) -> Int {
+        let minR = readDouble("F\(idx)Mn") ?? 1200
+        return Int(minR)
+    }
+
 
     // MARK: - Apple Silicon fan-control dance
 
@@ -560,20 +588,39 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         //  • .constant: re-push the user's setpoint. Apple Silicon's
         //    thermalmonitord otherwise claws F0Tg back to whatever it
         //    thinks the current load needs, so the physical fan drifts
-        //    away from what the user pinned. One writeRPM/tick is cheap
-        //    and keeps the firmware honest.
+        //    away from what the user pinned.
+        //
+        // Routing: try a direct writeRPM first (fast, no IPC, succeeds
+        // when this process happens to have SMC write privileges); on
+        // failure route through helper.setTarget (one cheap socket call
+        // — the helper runs as root so the SMC write actually lands).
+        // The GUI is non-root, so on Apple Silicon the helper path is
+        // typically the one that actually moves the fan.
         for fan in cachedFans {
             guard let fanIdx = Int(fan.id.dropFirst()) else { continue }
+            let target: Int?
             switch fan.mode {
             case .sensorBased(let sid, let lo, let hi):
                 if let s = newSensors.first(where: { $0.id == sid }) {
-                    let target = rpmForTemp(s.celsius, fan: fan, low: lo, high: hi)
-                    _ = writeRPM(fanIdx: fanIdx, rpm: target)
+                    target = rpmForTemp(s.celsius, fan: fan, low: lo, high: hi)
+                } else {
+                    target = nil
                 }
             case .constant(let rpm):
-                _ = writeRPM(fanIdx: fanIdx, rpm: rpm)
+                target = rpm
             case .auto:
-                break
+                target = nil
+            }
+            guard let rpm = target else { continue }
+            // No dedupe by "target unchanged" — we MUST push every tick
+            // even when our intent is identical, because the firmware's
+            // claw-back changes the SMC's view (F0Tg/F0Ac) without
+            // changing ours. Re-pushing is what keeps the physical fan
+            // pinned. helperClient.setMode(.constant(...)) wraps a single
+            // socket round-trip + unlock-already-succeeded fast path; the
+            // cost is in the order of a millisecond per fan per tick.
+            if !writeRPM(fanIdx: fanIdx, rpm: rpm) {
+                _ = helperClient.setMode(.constant(rpm: rpm), for: fan.id)
             }
         }
     }

@@ -7,6 +7,7 @@
 //
 
 import SwiftUI
+import AppKit
 import GenesisFanControlCore
 
 struct SensorPanel: View {
@@ -62,14 +63,20 @@ struct SensorPanel: View {
                 .foregroundColor(.gfcTextMuted)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-            // SettingsLink is the canonical macOS 14+ way to open the
-            // Settings scene. openSettings() from a deep child view is
-            // unreliable — sometimes the Environment doesn't propagate.
-            SettingsLink {
+            // SettingsLink looks like the right tool, but in a hidden-
+            // title-bar + ScrollView header it intermittently swallows
+            // its click. NSApp.sendAction("showSettingsWindow:") is the
+            // older AppKit selector that the Settings scene installs on
+            // the responder chain — it just works regardless of activation
+            // policy or window chrome state.
+            Button {
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            } label: {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 12))
                     .foregroundColor(.gfcTextSecondary)
                     .contentShape(Rectangle())
+                    .frame(width: 18, height: 18)
             }
             .buttonStyle(.plain)
             .help("Open Settings (⌘,)")
