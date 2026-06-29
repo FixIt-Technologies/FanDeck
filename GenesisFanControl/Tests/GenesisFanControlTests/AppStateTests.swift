@@ -16,6 +16,16 @@ final class AppStateTests: XCTestCase {
         AppState(smc: MockSMCService(), autoStartPolling: false)
     }
 
+    /// tick() dispatches the SMC read onto smcQueue and hops the publish
+    /// onto a `Task { @MainActor in … }`. Spin the runloop briefly so
+    /// both hops drain before the assertion fires; without this the
+    /// synchronous assertion observes pre-tick state and flakes.
+    private func drainTicks(_ count: Int = 1) {
+        for _ in 0..<count {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        }
+    }
+
     // MARK: - Construction
 
     func testInitialPopulatesFromSnapshot() {
@@ -39,6 +49,7 @@ final class AppStateTests: XCTestCase {
         let before = state.lastUpdated
         let beforeWallClock = Date()
         state.tick()
+        drainTicks()
         XCTAssertGreaterThan(state.lastUpdated, before)
         XCTAssertGreaterThanOrEqual(state.lastUpdated, beforeWallClock)
     }
@@ -46,7 +57,10 @@ final class AppStateTests: XCTestCase {
     func testTickRefreshesSensors() {
         let state = makeState()
         let initial = state.sensors.map(\.celsius)
-        for _ in 0..<30 { state.tick() }
+        for _ in 0..<30 {
+            state.tick()
+            drainTicks()
+        }
         let updated = state.sensors.map(\.celsius)
         let anyChanged = zip(initial, updated).contains { abs($0 - $1) > 0.01 }
         XCTAssertTrue(anyChanged, "Sensors should drift after many ticks")
@@ -56,7 +70,11 @@ final class AppStateTests: XCTestCase {
         let state = makeState()
         guard let fanID = state.fans.first?.id else { return XCTFail("No fans") }
         state.setMode(.constant(rpm: 4500), for: fanID)
-        for _ in 0..<60 { state.tick() }
+        drainTicks()
+        for _ in 0..<60 {
+            state.tick()
+            drainTicks()
+        }
         let fan = state.fan(withID: fanID)
         XCTAssertEqual(fan?.currentRPM, 4500,
                        "After enough ticks the fan should reach the constant target")
