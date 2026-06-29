@@ -163,8 +163,42 @@ mode. The fix, cribbed from
    ("still busy"); somewhere in the middle the write lands.
 
 Worst-case wall clock on the first write: ~3.5 s. Subsequent writes hit
-the fast path (~1 ms). To release: `Ftst = 0` returns control to
-thermalmonitord.
+the fast path (~1 ms).
+
+**Release direction matters.** To return to auto, you must write the
+mode key FIRST while `Ftst` is still unlocked, THEN drop `Ftst`:
+
+```swift
+writeUInt8("F0Md", 0)   // mode back to auto WHILE Ftst is still 1
+writeUInt8("Ftst", 0)   // re-lock; firmware reclaims fan control
+```
+
+Doing it the other way around (`Ftst=0` first, `F0Md=0` second) silently
+fails: the firmware re-locks the moment `Ftst` goes 1→0 and ignores the
+subsequent `F0Md` write. Symptom was the "click Auto → UI blinks to
+auto → snaps back to the previous constant" bug.
+
+**Per-tick re-assertion.** thermalmonitord can claw back `F0Tg` (and
+the physical `F0Ac`) under thermal governance — set a fan to 5500 RPM
+and the firmware may drop it to ~4100 within seconds, even while
+`F0Md=1`. Our defense is `primeSnapshot()`'s host loop: every poll
+tick re-pushes the user's intended target via `writeRPM`, with a
+fall-back to `helperClient.setMode(.constant(rpm:))` when the GUI's
+direct (non-root) write is rejected. This makes the re-assertion the
+*mechanism* for both `.constant` and `.sensorBased` modes, not just
+maintenance. Cost is ~1 ms / fan / tick.
+
+**Cold-start safe-reset.** On every `AppleSMCService.init`, we drop
+every fan we discover in `F0Md=1` back to `F0Md=0` (auto) before the
+first snapshot. Reason: if a previous run crashed mid-constant,
+thermalmonitord left `F0Tg` at whatever it last clamped, and a fresh
+init would otherwise adopt that value as "user intent" and re-assert
+it forever via the host loop.
+
+**Absolute RPM safety floor.** `writeRPM(fanIdx:rpm:)` clamps to
+`max(800, rawRPM)` BEFORE encoding so no path (CLI, helper, host
+re-assertion, future programmatic) can write 0 — which on most Mac
+fans stalls the bearing.
 
 We run this whole sequence on a dedicated `DispatchQueue` so it never
 freezes the SwiftUI main thread — see *Concurrency model* below.
@@ -272,11 +306,31 @@ directly (`socket(AF_UNIX, SOCK_STREAM, 0)` → `bind` → `chmod 0666` →
 `listen` → `accept`). One connection per RPC keeps the helper trivially
 stateless.
 
+### Protocol version + auto-update banner
+
+`HelperConstants.protocolVersion` is bumped on **every** helper-side
+behavior fix (even bug-fix-only). Each ping response carries the
+helper's compiled version. `HelperClient.health()` returns one of:
+
+- `.healthy(version)` — helper alive AND version matches
+- `.outdated(installed, current)` — helper alive but stale
+- `.down` — socket unreachable
+
+`AppState.tick` reads `health()` every second. On `.outdated`,
+`needsElevation` is raised immediately and persistently so the user
+sees a banner with explicit copy ("Helper is out of date — installed
+v1, GUI expects v2") and an "Update Helper" button that re-runs the
+same admin-privileged install flow. This catches the case where the
+GUI binary has fix X but the installed helper at `/usr/local/sbin/`
+is still the binary from before X — without this, the user wouldn't
+know they need to re-install and would just see broken behavior.
+
 Socket path: `/var/run/genesis-fan-control.sock` (0666, world-writable).
-NB: per the research note, this is a real security smell — any local
-process can crank fans. The reference NSXPC pattern uses
-`getpeereid()` + a code-signature check on `shouldAcceptNewConnection`.
-This is on the punch list under "Known limitations".
+**Known security smell** — any local process can crank fans. Review
+flagged this HIGH. Mitigation in progress: `getpeereid(2)` in helper
+accept loop + `chmod 0660`. Migration path to `SMAppService.daemon` +
+XPC for codesigning-anchored identity check is documented in
+*Future work*.
 
 ### Why not `NSXPCConnection`?
 
@@ -297,10 +351,21 @@ The migration path is documented in *Future work*.
 
 The main window uses `.windowStyle(.hiddenTitleBar)` — content extends
 all the way to the top of the window for a seamless dark surface. The
-custom top "status bar" overlay pads 64 px on the left to clear the
-traffic-light buttons and shows: app name, backend pill
-(`AppleSMC` green, `MockSMC · SIM` amber), last-updated timestamp,
-gear button to open Settings.
+custom top "status bar" overlay pads 70 px on the left to clear the
+traffic-light buttons and shows: app name, backend pill (`AppleSMC`
+green, `MockSMC · SIM` amber). The gear button + Updated timestamp
+live in the SensorPanel header on the right (same y row).
+
+**Hit-testing gotcha** (HARD-WON): the ZStack must declare the
+interactive `HStack { fansColumn; SensorPanel }` AFTER `topStatusBar`
+so the interactive side wins SwiftUI's last-declared-first hit-test
+order. An HStack with a trailing `Spacer()` claims hit-testing for
+its *whole* frame width — so if topStatusBar is on top of SensorPanel
+at y=0..28, every click in the SensorPanel header's territory (gear
+included) gets eaten by topStatusBar's Spacer and dropped. Belt-and-
+braces: `.allowsHitTesting(false)` on topStatusBar (purely decorative,
+no buttons). This was diagnosed via the SwiftUI expert skill after
+three failed action-dispatch fixes that all addressed the wrong layer.
 
 Below that is a two-column layout:
 - **Center** — a `ScrollView` of `FanGaugeCard` per fan (stacked).
@@ -343,34 +408,53 @@ on every cursor move so the fan tracks live as you drag.
 
 Three modes:
 
-1. **Automatic** — `.auto`. Writes `Ftst = 0` + `F\(i)Md = 0`, returning
-   control to thermalmonitord.
+1. **Automatic** — `.auto`. Writes `F\(i)Md = 0` (still under unlock)
+   then `Ftst = 0`. Order matters — see *Apple Silicon write path*
+   above.
 2. **Constant speed** — `.constant(rpm: Int)`. Goes through the full
-   `unlockFanControl` dance, then `writeRPM(fanIdx:rpm:)`.
-3. **Sensor-based** — `.sensorBased(sensorId: String, lowTempC: Double,
-   highTempC: Double)`. Host-driven: every polling tick, AppState reads
-   the named sensor, computes `lerp(minRPM, maxRPM, t)` where
-   `t = (currentTemp - lowTempC) / (highTempC - lowTempC)`, and pushes
-   the resulting RPM to `F\(i)Tg`. (The SMC firmware doesn't know about
-   our sensor mode — to it, we're just writing constants at 1 Hz.)
+   `unlockFanControl` dance, then `writeRPM(fanIdx:rpm:)`. The per-tick
+   re-assertion in `primeSnapshot()` keeps the firmware from clawing
+   the setpoint back under thermal governance.
+3. **Sensor-based** — `.sensorBased(sensorId: String, points: [RampPoint])`.
+   Host-driven N-point piecewise-linear curve. `RampPoint = { tempC,
+   rpm }`. Every polling tick reads the named sensor and interpolates
+   between the sorted points: clamps to `first.rpm` below
+   `first.tempC`, clamps to `last.rpm` above `last.tempC`, lerps
+   between consecutive points otherwise. Result is clamped into
+   `[fan.minRPM, fan.maxRPM]` and pushed to `F\(i)Tg`.
 
-The sensor picker now lists every sensor with its **live temperature**
-on the right side of each menu row, so the user can pick the right one
-without leaving the modal.
+The sensor picker lists every sensor with its **live temperature** on
+the right side of each menu row, so the user can pick the right one
+without leaving the modal. Rendered as `Menu { Button { Label(...,
+systemImage:) } }` (NSMenuItem only takes the first Text of a Button
+label — embed the temperature into the title string).
 
 The LIVE PREVIEW card has a Swift Chart of the ramp curve:
-- Cyan piecewise-linear line: clamps at minRPM before `lowTempC`, ramps
-  to maxRPM at `highTempC`, clamps again past it; with a gradient
-  AreaMark underneath for visual mass.
-- Green anchor dot at `(lowTempC, minRPM)`, red anchor dot at
-  `(highTempC, maxRPM)`, both labeled.
+- Cyan piecewise-linear line through all `RampPoint`s with clamps on
+  either end, with a gradient AreaMark underneath for visual mass.
+- One **draggable** dot per point. First point is green, last is red,
+  intermediates are cyan. Drag horizontally to change temp, vertically
+  to change RPM. Drag is clamped per-axis AND prevented from crossing
+  neighbor temps so the curve stays monotonically left-to-right (no
+  visual kinks).
+- **Double-click** anywhere in the empty plot area adds a new point
+  at that `(tempC, rpm)`.
+- **Right-click** a point → "Delete point" (when N > 2).
+- Compact per-point editor above the chart for keyboard / steppers
+  with delete buttons (disabled when N ≤ 2) and an "Add point" link
+  that inserts a vertex halfway between the last two.
 - Amber dashed `RuleMark` at the current sensor reading, with a glowing
   PointMark on the curve at the projected RPM, annotated with both
   `"X.X °C"` and `"→ N RPM"`.
 
-Multi-point curves (drag points around the chart to define an arbitrary
-ramp) are a planned follow-up — requires `FanMode.sensorBased` to carry
-`[(Double, Int)]` instead of two anchors.
+**Sensor-based config persistence.** `SettingsStore.sensorRampConfigs:
+[String: SensorRampConfig]` (per-fan, JSON-persisted to UserDefaults).
+The sheet hydrates from `settings.sensorRampConfig(for: fanID)` which
+first tries this fan's own config, then ANY sibling fan's (so the
+second fan inherits from the first — "copy from sibling" on the first
+sensor-based pick). On Apply, the chosen config is saved REGARDLESS
+of which mode the user is committing — so switching to constant or
+auto and back later restores the exact ramp.
 
 ---
 
@@ -395,13 +479,23 @@ result. `setMode` is fire-and-forget:
 
 1. **Optimistic UI** (MainActor) — update `fan.mode`, `fan.targetRPM`,
    `fan.currentRPM` immediately so the gauge tracks the user's intent
-   while the write is in flight. `writeInFlight = true`.
+   while the write is in flight. Capture the intent into
+   `pendingIntent[fanID]` so any polling tick that lands between the
+   optimistic update and the write completion can MERGE the intent
+   over the snapshot (otherwise the UI flickers back to whatever the
+   firmware reports — typically the previous setpoint).
+   `writeInFlight = true`.
 2. **Queue** — `smcQueue.async { smc.setMode(...) → smc.refresh() →
    smc.snapshot() }`.
-3. **Reconcile** (MainActor) — when the write returns, publish the
-   real snapshot. If the kernel rejected (`ok == false`), set
-   `needsElevation = true` so the banner re-appears. `writeInFlight =
-   false`.
+3. **Reconcile** (MainActor) — clear `pendingIntent[fanID]`, then
+   publish the real snapshot. If the kernel rejected (`ok == false`),
+   set `needsElevation = true` so the banner re-appears.
+   `writeInFlight = false`.
+
+`AppState.publish(snapshot:)` is the single funnel that publishes
+fans/sensors — both `tick()` and `setMode()` go through it. It merges
+`pendingIntent` over `snap.fans` so optimistic state survives any
+in-flight snapshot.
 
 `SMCService` is marked `Sendable`; concrete classes use `@unchecked
 Sendable` because their mutable cache is guarded by the queue.
@@ -543,48 +637,100 @@ RPM count > 0.
 
 ## Known limitations
 
-(Sorted by severity.)
+The 3-lens review at `.claude/plans/2026-06-30-GenesisFanControlReview.md`
+audited the project and surfaced **41 findings** (25 HIGH+MED, 25/25
+adversarially confirmed). The table below tracks what shipped vs.
+what's still open.
 
-1. **Multi-point ramp curve not implemented.** `FanMode.sensorBased`
-   carries only `(lowTempC, highTempC)`. Real users want
-   `[(temp, rpm)]` so they can build a fan curve like "30°C → 1500 RPM,
-   60°C → 2500 RPM, 75°C → max". Requires a model change plus a
-   draggable-point editor on the existing Swift Chart.
-2. **Socket auth.** `/var/run/genesis-fan-control.sock` is 0666 with no
-   peer identity check. Any local process can crank fans. Fix: chmod
-   0660 + setgid to a `_fancontrol` group; OR `getpeereid()` +
-   console-user check; OR migrate to `NSXPCConnection` with a code
-   signature anchor.
-3. **Unsigned helper.** No team ID embedded in either binary. The
-   modern Apple way is `SMAppService.daemon(plistName:)` which requires
-   a signed `.app` bundle with the helper at
-   `Contents/Library/LaunchDaemons/<bundle-id>.plist`. Migration plan:
-   wrap the SPM output in an `.app` produced by a tiny Xcode workspace
-   that consumes the SPM package, then ship via Sparkle.
-4. **Missing M3/M4 sensor keys.** Our candidate-sensor list is
-   M1/M2-era — performance/efficiency cores under `Tp` prefix, GPU
-   under `Tg`. M3/M4 add `Te?? / Tf??` prefixes for some sensors that
-   we'd otherwise see. See the research note for the full table.
-5. **No `Ftst` cleanup on app quit.** If the user has a fan in constant
-   mode and quits via cmd-Q, `Ftst` stays at 1 (manual mode held).
-   thermalmonitord eventually undoes it (~minutes), but we should set
-   `Ftst = 0` for each manually-controlled fan in
-   `applicationShouldTerminate`.
-6. **Helper auto-update is manual.** If you rebuild via `bun run start`,
-   the new helper binary is sitting in `/usr/local/sbin/` but the
-   daemon is still running the old in-memory copy. `launchctl kickstart
-   -k system/<label>` would restart it; we don't run that on rebuild.
-   Mitigation: `bun run uninstall:app` + `bun run start` to fully
-   recycle.
-7. **Mock fallback is silent.** If `AppleSMCService.init?()` fails
-   (e.g. running on a sandboxed CI), AppState silently falls back to
-   `MockSMCService` and the user only knows because the backend pill in
-   the status bar says "MockSMC · SIM" in amber. A more obvious
-   "AppleSMC unreachable — running synthetic data" banner would be
-   kinder.
-8. **No in-app log viewer yet.** `LogStore.shared` collects entries but
-   nothing in the UI renders them. The plan was a "Logs" tab in
-   Settings.
+### ✅ Shipped since the review
+
+- **Multi-point ramp curve.** `FanMode.sensorBased(sensorId, points:
+  [RampPoint])` replaces the old two-anchor form. Draggable handles in
+  the chart, per-point editor with steppers, double-click to add,
+  right-click to delete. CLI adds `fans set <id> ramp <sensor>
+  <c1:rpm1> ...`.
+- **Helper protocol versioning + auto-update banner.** Bumped to v2;
+  GUI's `HelperClient.health()` returns `.healthy / .outdated / .down`;
+  AppState raises a persistent banner on `.outdated` with explicit
+  "installed v1, GUI expects v2 — click Update Helper to re-install".
+- **Per-tick re-assertion** (constant + sensor-based modes). Defeats
+  thermalmonitord claw-back. Direct write → fall back to
+  `helperClient.setMode(.constant)` when GUI is non-root.
+- **AUTO release direction fixed.** F0Md=0 BEFORE Ftst=0 (was inverted,
+  caused the "click Auto → blinks → reverts to old setting" bug).
+- **`writeRPM` absolute safety floor** (800 RPM) on every path —
+  closes the "CLI / helper / programmatic can write 0 and stall the
+  bearing" hole.
+- **Cold-start safe-reset.** On `AppleSMCService.init`, every fan
+  found in F0Md=1 is dropped back to auto before the first snapshot —
+  so a crashed previous run can't strand a fan pinned at the
+  firmware-clamped value.
+- **`pendingIntent` merge.** Polling tick that fires between optimistic
+  UI update and `setMode` completion no longer overrides the user's
+  intent ("set 2052, gauge flickers between 2052 and the old value").
+- **Sensor-based config persistence + cross-fan inheritance.** Switch
+  to constant/auto and back restores the exact sensor + curve. Second
+  fan's first sensor-based pick inherits from the first.
+- **Gear-button hit-testing** (3 wrong diagnoses before the
+  SwiftUI-skill-assisted root cause): ZStack order + topStatusBar
+  `.allowsHitTesting(false)`.
+- **Sensor picker shows live temps per row** (Menu+Button+Label,
+  embed temp in the title string — NSMenuItem only takes the first
+  Text).
+- **Gauge gap at high RPM**: tightened fill shadow radius 6→2 so the
+  glow doesn't bleed past the cyan SetpointWall.
+- **`includeEGPU` + `includeExternalDrives` (Tt-prefix) wired** — were
+  no-op toggles.
+
+### 🟥 Still open (from the review)
+
+1. **Socket has no peer-cred check.** Any local process can drive
+   fans via `/var/run/genesis-fan-control.sock`. Fix: `getpeereid(2)`
+   in helper accept + `chmod 0660`. Ideal endgame:
+   `SMAppService.daemon` + XPC with codesigning anchor.
+2. **No crash-recovery in the helper.** If the GUI dies, the per-tick
+   re-assertion stops; firmware clawback wins; Ftst stays open. Fix:
+   helper-side deadline timer + SIGTERM handler that reverts every
+   locked fan to F0Md=0 / Ftst=0 before unlink/exit.
+3. **No max-hold watchdog.** Constant mode persists forever. Fix:
+   30 min default → auto-revert + notification.
+   `applicationWillTerminate` drops manual fans to auto.
+4. **No sleep/wake handler.** Battery → AC transition and S3/S4 wake
+   currently don't re-assert. Observe `NSWorkspace.willSleep/didWake`.
+5. **`Ftst` is global, treated per-fan.** Releasing fan 0 while fan 1
+   is still in constant clears the unlock for fan 1 too. Fix: count
+   locked fans; only zero Ftst when count drops to 0.
+6. **CLI `fans set` leaves fan degraded after exit** — re-assertion
+   never runs from the CLI process. Either move the loop into the
+   helper (cleanest) or warn loudly that the GUI must stay running.
+7. **`FanControlSheet` captures `let fan: Fan`** — value type frozen
+   at sheet construction. Refactor to `let fanID: String` + computed
+   live lookup so the live preview's "Currently reported" updates.
+8. **6 settings toggles still dead.** `openAtLogin` (wire via
+   SMAppService.mainApp), `checkUpdatesOnLaunch`, `languageCode`,
+   `menuBarIconStyle`, `menuBarFan`, `menuBarSensorIDs`. Wire each or
+   remove the control — current UI promises actions that never happen.
+
+### 🟨 Smaller stuff (full list in the review file)
+
+- Multi-click setMode race wipes pendingIntent (per-fan version
+  tokens).
+- No socket timeouts; slow unlock pins smcQueue ~33 s.
+- Per-tick `helperClient.setMode` is a fresh socket + 3 SMC
+  round-trips — sticky session would amortize.
+- HelperInstaller bash uses `'` quotes with no escaping of
+  `helperBinary` path.
+- Drag gesture fires SMC write per pixel — should commit only
+  onEnded.
+- MenuBarIconTab Picker rows use HStack{Image,Text} — same
+  collapse-to-first-Text bug as the sensor picker had; fix with
+  Label(...).tag(...).
+- Activation-policy demote 300 ms `asyncAfter` has no cancel.
+- Sensor disappears → fan stays pinned in unlocked constant state
+  with no fallback.
+- Missing M3/M4 sensor keys (`Te??` / `Tf??`).
+- Mock fallback is silent (banner would be kinder).
+- No in-app log viewer.
 
 ---
 
