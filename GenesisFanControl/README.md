@@ -1,49 +1,637 @@
 # GenesisFanControl
 
-A SwiftUI macOS clone of [Macs Fan Control](https://crystalidea.com/macs-fan-control) with a modern dark UI.
+A SwiftUI macOS clone of [Macs Fan Control](https://crystalidea.com/macs-fan-control)
+with a modern dark UI, a working IOKit/AppleSMC backend on Apple Silicon,
+a privileged helper daemon for fan writes, and a global `fans` CLI that
+shares the same backend as the GUI.
 
-## Status
+Tested on MacBookPro21,5 (M4 Pro, macOS 15). The read path also works on
+Intel Macs; the write path's Apple-Silicon `Ftst` dance is a no-op there.
 
-Bootstrap. The UI shell, settings window, per-fan control sheet, theme, and logging are all in place. The SMC backend currently uses a **mock** implementation that returns three fake fans + a representative sensor list so the app builds and runs end-to-end without root or SMC entitlements.
+---
 
-## Run
-
-### In Xcode (recommended)
-
-Open `apps/GenesisFanControl/Package.swift` in Xcode (or drag the `apps/GenesisFanControl` folder onto the Xcode dock icon). Xcode treats SwiftPM executable targets as runnable apps:
-
-1. Xcode finishes "resolving dependencies" (instant — no deps).
-2. Select the `GenesisFanControl` scheme in the toolbar.
-3. ⌘R.
-
-The app launches as a normal SwiftUI macOS window plus a menu-bar item. Press ⌘, to open Settings.
-
-### From the terminal
+## Quick start
 
 ```bash
 cd apps/GenesisFanControl
-swift run                # build + launch the menu-bar app
-swift build              # build only
+bun install         # nothing actually pulled — only scripts/ has TS
+bun run start       # build release + install /Applications/.app + launch
 ```
 
-## Layout
+The first run pops one macOS admin prompt to drop a symlink at
+`/usr/local/bin/fans`. Subsequent `bun run start` invocations need no
+password — the install layout uses symlinks so every rebuild is
+instantly reflected.
 
-- `Sources/GenesisFanControl/App/` — `@main` entry point, app delegate, app state
-- `Sources/GenesisFanControl/Logging/` — `Log` proxy, `GFCLogger` (os.Logger backend), `LogStore` (in-memory ring buffer for the in-app log browser)
-- `Sources/GenesisFanControl/Theme/` — colors, typography, spacing, radii, animations, `SettingsCard`, `NeonToggleStyle`, `SidebarNavItem`, `VisualEffectBlur`, …
-- `Sources/GenesisFanControl/SMC/` — `SMCService` protocol + `MockSMCService` (real `AppleSMC` impl is a TODO)
-- `Sources/GenesisFanControl/Settings/` — 3-tab Settings window: General, Temperature Sensors, Menu Bar Icon
-- `Sources/GenesisFanControl/FanControl/` — Per-fan control sheet (Constant RPM vs Sensor-controlled with thresholds)
-- `Sources/GenesisFanControl/MainWindow/` — Dashboard sidebar + detail
-- `Sources/GenesisFanControl/Shared/` — `ConstraintSafeWindow` and other AppKit glue
+To control fans, click **Install Helper** in the amber banner that
+appears when you drag a fan; a second admin prompt installs a launchd
+daemon at `/usr/local/sbin/genesis-fan-control-helper`. From then on,
+the GUI's drag-to-set drives real fans without `sudo`.
 
-## Theme
+```bash
+fans list                       # globally available
+fans get F0
+sudo fans set F0 const 3500     # write directly without the helper
+sudo fans set F0 auto
+fans watch                      # 1Hz tail of RPMs + headline sensor
+```
 
-Ported and consolidated from [TimeTravel](../../../Rewind/apps/timetravel-app/TimeTravel) — same neon/cyberpunk dark palette (`Color.settingsBackground`, `Color.neonAmber`, …), same `SettingsCard` / `SidebarNavItem` / `NeonToggleStyle` primitives. One palette (the `settings*` / `neon*` side) — the `tt*` palette wasn't ported because it was specific to TimeTravel's overlay HUD.
+---
+
+## Project layout
+
+```
+apps/GenesisFanControl/
+├── Package.swift                  # SPM manifest — 3 executables + library + tests
+├── package.json                   # Bun-driven build / install / dev scripts
+├── README.md                      # this file
+├── scripts/
+│   ├── install.ts                 # build → /Applications/.app + /usr/local/bin
+│   ├── uninstall.ts               # remove .app, CLI symlink, helper daemon
+│   ├── dev.ts                     # watch mode — fs.watch + debounced rebuild
+│   ├── build-icon.swift           # render fanblades.fill → AppIcon.icns
+│   └── AppIcon.icns               # generated, ignored .iconset stays out of git
+├── Sources/
+│   ├── GenesisFanControlCore/     # shared library
+│   │   ├── AppState/AppState.swift
+│   │   ├── Logging/{Log,GFCLogger,LogStore}.swift
+│   │   ├── Privileged/{HelperProtocol,HelperClient,HelperInstaller,UnixSocket}.swift
+│   │   ├── SMC/{AppleSMCService,MockSMCService,SMCService,SMCModels}.swift
+│   │   └── Settings/SettingsStore.swift
+│   ├── GenesisFanControl/         # the SwiftUI app
+│   │   ├── App/{GenesisFanControlApp,AppDelegate}.swift
+│   │   ├── FanControl/FanControlSheet.swift
+│   │   ├── MainWindow/{MainView,FanGaugeCard,SensorPanel}.swift
+│   │   ├── Settings/{SettingsRootView,GeneralSettingsTab,TemperatureSensorsTab,MenuBarIconTab}.swift
+│   │   └── Theme/{Theme,Components}.swift
+│   ├── GenesisFanControlHelper/main.swift   # root daemon
+│   └── fans/main.swift                       # CLI
+└── Tests/GenesisFanControlTests/             # 99 XCTest cases
+```
+
+Four targets, one library:
+
+| Target | Kind | Purpose |
+|---|---|---|
+| `GenesisFanControlCore` | library | SMC bridge, AppState, settings, logging, helper protocol — shared by everything below |
+| `GenesisFanControl` | executable | SwiftUI app, menu-bar icon, settings window |
+| `GenesisFanControlHelper` | executable | privileged daemon launched by launchd; owns SMC writes |
+| `fans` | executable | command-line client; runs against the same `AppleSMCService` directly |
+
+---
+
+## The SMC backend
+
+`Sources/GenesisFanControlCore/SMC/AppleSMCService.swift` is the real IOKit
+bridge. It speaks the standard private-AppleSMC ioctl that every Swift /
+Objective-C SMC wrapper in the wild uses (smcFanControl, SMCKit, stats,
+AlDente, BatFi, fastfetch, btop, …).
+
+### The wire protocol
+
+Open the service:
+
+```swift
+IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+IOServiceOpen(service, mach_task_self_, 0, &connection)
+```
+
+Then `IOConnectCallStructMethod(connection, selector=2, input80B, 80, output80B, &80)`,
+where the 80-byte buffer is **the** `SMCParamStruct`:
+
+```text
+offset  size  field
+   0     4    key (FourCC, e.g. 'F0Ac')
+   4     6    vers (SMCVersion)
+  10     2    (padding)
+  12    16    pLimitData (SMCPLimitData)
+  28    12    keyInfo (SMCKeyInfoData — dataSize, dataType, dataAttributes + 3B pad)
+  40     1    result (0 = ok; SMC firmware error otherwise)
+  41     1    status
+  42     1    data8 (call type: 5=read, 6=write, 9=getKeyInfo)
+  43     1    (padding)
+  44     4    data32
+  48    32    bytes (payload)
+                                                    total = 80
+```
+
+Swift's default struct layout packs `SMCKeyInfoData` to 9 bytes (no
+trailing padding). The kernel expects the struct to be 80 bytes total,
+so we add three explicit `UInt8` pad fields to `SMCKeyInfoData` to round
+it to 12. A `precondition(MemoryLayout<SMCParamStruct>.stride == 80)`
+crashes startup if anyone ever re-packs it; without it, the kernel
+returns garbage values silently.
+
+### Data type tags
+
+`keyInfo.dataType` is itself a FourCC. Decoders we support:
+
+| Type tag | Bytes | Semantics |
+|---|---|---|
+| `"ui8 "` | 1 | unsigned 8-bit |
+| `"ui16"` | 2 | unsigned 16-bit big-endian |
+| `"ui32"` | 4 | unsigned 32-bit big-endian |
+| `"si8 "` | 1 | signed 8-bit |
+| `"si16"` | 2 | signed 16-bit big-endian |
+| `"fpe2"` | 2 | 14-bit unsigned int, 2-bit fraction (raw / 4) — most common fan target on Intel |
+| `"sp78"` | 2 | signed 8.8 fixed-point (raw / 256) — common temperature |
+| `"flt "` | 4 | IEEE 754 32-bit float — **the** Apple Silicon fan/temp encoding |
+
+Encoders only need to be exact for the keys we WRITE — that's fan mode
+(ui8) and fan target (fpe2 or flt, machine-dependent — see below).
+
+### Apple Silicon write path — the `Ftst` unlock dance
+
+This is the single most important Apple Silicon finding. On Intel,
+forcing manual mode is one write: `F{i}Md = 1`. On M1 / M2 / M3 / M4,
+the SMC kernel accepts that write (`result == 0`) but `thermalmonitord`
+silently undoes it within milliseconds, leaving the fan in OS-managed
+mode. The fix, cribbed from
+[exelban/stats SMC/smc.swift:566-602](https://github.com/exelban/stats/blob/master/SMC/smc.swift):
+
+1. **Fast path** — try `writeUInt8("F0Md", 1)` directly. If the fan is
+   already unlocked (from a previous `setMode`), this succeeds and we're
+   done in microseconds.
+2. **Read `Ftst`**. If it doesn't exist, give up — we're on a machine
+   where this lock doesn't apply.
+3. If `Ftst != 1`, **write `Ftst = 1`**, retry up to 100× at 50 ms each
+   until the SMC accepts it. (This is the firmware "unlock fan control"
+   permission.)
+4. **Sleep 3 s.** thermalmonitord polls; we have to wait for it to see
+   the unlock and yield.
+5. **Retry `F0Md = 1` up to 300×** at 100 ms. The first ~5 usually fail
+   ("still busy"); somewhere in the middle the write lands.
+
+Worst-case wall clock on the first write: ~3.5 s. Subsequent writes hit
+the fast path (~1 ms). To release: `Ftst = 0` returns control to
+thermalmonitord.
+
+We run this whole sequence on a dedicated `DispatchQueue` so it never
+freezes the SwiftUI main thread — see *Concurrency model* below.
+
+### `F0Tg` is `flt`, not `fpe2`
+
+A subtle bug we hit early: on Apple Silicon, the fan target key
+`F\(i)Tg` is encoded as a 4-byte IEEE 754 float (`"flt "`), not the
+2-byte `fpe2` used on Intel. Writing `fpe2` bytes `(hi, lo, 0, 0)` into
+a 4-byte float slot produces an IEEE 754 denormal ≈ 1e-43 RPM, which
+the firmware floors or fail-safes to maximum. (Hence: "I set the fan to
+2500 RPM and it ramped to max instead.")
+
+`writeRPM(fanIdx:rpm:)` first calls `getKeyInfo` to read the actual
+type tag, then branches:
+
+```swift
+switch typeStr {
+case "fpe2":
+    let raw = UInt16(rpm) << 2     // 14.2 fixed
+    bytes[0] = hi; bytes[1] = lo
+case "flt ":
+    let bits = Float(rpm).bitPattern    // little-endian on disk
+    bytes[0..<4] = bits.littleEndianBytes
+case "ui16":
+    bytes[0..<2] = UInt16(rpm).bigEndian
+}
+```
+
+The same dispatch is used for `Ftst` (`ui8`), mode keys (`ui8`), and
+anything else we ever write.
+
+### `F0Md` case quirk
+
+Different Macs expose the mode key as `F0Md` (uppercase) or `F0md`
+(lowercase). `modeKey(forFan:)` probes both at first call and caches
+the one that answers in `modeKeyCache`, then reuses it. Without this,
+machines that only expose lowercase silently fail every fan write.
+
+### Sensor discovery
+
+`FNum` returns the fan count (`ui8`). We probe `F0` … `F{n-1}` for
+each fan's `Ac` / `Mn` / `Mx` / `Tg` / `Md` keys.
+
+Temperatures are discovered by probing a hand-curated list of ~30
+candidate keys (`AppleSMCService.candidateSensors`) — only the ones
+the chip actually answers are kept. The list covers M-series CPU
+performance/efficiency cores (`Tp09 / Tp0T / Tp0b / Tp0d / Tp0f / Tp0n`),
+GPU clusters (`Tg0D / Tg0V` etc.), battery (`TB0T / TB1T / TB2T`),
+NVMe SSDs (`TH0a / TH0b / TH0x`), airport (`TW0P`), thunderbolt
+(`TTLD / TTRD`), and power-supply proximity (`TPSP`).
+
+The catalog isn't exhaustive — research notes in
+`~/Tresors/Projects/GenesisBrain/GenesisTools/Fans/Research-2026-06-29.md`
+identify another ~20 M3 / M4-specific keys (`Te0?`, `Tf??` prefixes)
+that we don't probe yet.
+
+---
+
+## Privileged helper daemon
+
+Fan writes need root. The GUI doesn't run as root, so we ship a tiny
+helper daemon that does.
+
+### Installation flow
+
+`HelperInstaller.install()` is invoked from the GUI's "Install Helper"
+button (in the elevation banner). It runs **one** `osascript` "with
+administrator privileges" call to:
+
+1. Wipe any legacy MacsFanControl-era helper (`launchctl bootout` +
+   `rm -f` of its plist, binary, socket).
+2. Copy the freshly built helper binary to
+   `/usr/local/sbin/genesis-fan-control-helper` (root:wheel, 0755).
+3. Write `/Library/LaunchDaemons/dev.foltyn.genesis-fan-control.helper.plist`
+   with `RunAtLoad=true`, `KeepAlive=true`, log paths under `/var/log/`.
+4. `launchctl bootout system <plist>` (in case of upgrade), then
+   `launchctl bootstrap system <plist>` to load it, then
+   `launchctl kickstart -k system/<label>` to force-start it.
+5. Wait up to 3 s for the daemon's Unix socket to come up. If `ping()`
+   succeeds we're done; otherwise throw `.timeout`.
+
+### IPC — JSON over a Unix domain socket
+
+`HelperProtocol.swift` defines a tiny Codable enum:
+
+```swift
+public enum HelperRequest: Codable {
+    case ping
+    case setAuto(fanID: String)
+    case setConstant(fanID: String, rpm: Int)
+}
+
+public struct HelperResponse: Codable {
+    public let ok: Bool
+    public let error: String?
+    public let backendName: String?
+    public let protocolVersion: Int?
+}
+```
+
+Wire format: one JSON object per line, `\n`-delimited, one request →
+one response → close. `UnixSocket.swift` wraps the BSD socket calls
+directly (`socket(AF_UNIX, SOCK_STREAM, 0)` → `bind` → `chmod 0666` →
+`listen` → `accept`). One connection per RPC keeps the helper trivially
+stateless.
+
+Socket path: `/var/run/genesis-fan-control.sock` (0666, world-writable).
+NB: per the research note, this is a real security smell — any local
+process can crank fans. The reference NSXPC pattern uses
+`getpeereid()` + a code-signature check on `shouldAcceptNewConnection`.
+This is on the punch list under "Known limitations".
+
+### Why not `NSXPCConnection`?
+
+Because for an unsigned dev binary built by SwiftPM, the path of least
+resistance is a Unix socket. `NSXPCConnection` + machService is the
+canonical Apple choice and would gain us the codesigning-anchored
+identity check for free, but it requires the helper to be inside an
+`.app` bundle at `Contents/Library/LaunchDaemons/`, signed with the
+same team ID, and registered via `SMAppService.daemon(plistName:)`.
+That's incompatible with `swift build -c release` standalone binaries.
+The migration path is documented in *Future work*.
+
+---
+
+## SwiftUI app
+
+### Window layout
+
+The main window uses `.windowStyle(.hiddenTitleBar)` — content extends
+all the way to the top of the window for a seamless dark surface. The
+custom top "status bar" overlay pads 64 px on the left to clear the
+traffic-light buttons and shows: app name, backend pill
+(`AppleSMC` green, `MockSMC · SIM` amber), last-updated timestamp,
+gear button to open Settings.
+
+Below that is a two-column layout:
+- **Center** — a `ScrollView` of `FanGaugeCard` per fan (stacked).
+- **Right** — a fixed-width 280 px `SensorPanel` listing every
+  temperature, grouped by kind, color-coded by reading (green < 45,
+  amber < 65, orange < 80, red ≥ 80 °C).
+
+### `FanGaugeCard`
+
+Each card has:
+- Fan name + ID label + a mode pill ("AUTOMATIC", "CONSTANT SPEED",
+  "SENSOR-BASED")
+- The interactive `DraggableRPMGauge` (described below)
+- min / max RPM labels under the gauge
+- Three `MetricChip` tiles (CURRENT / TARGET / LOAD)
+- An "Auto" button (only when mode ≠ .auto) + the "Configure…" modal trigger
+
+### `DraggableRPMGauge`
+
+The bar is BOTH a live indicator AND a setter:
+
+- The colored fill is always the current RPM, animated with a 1.0 s
+  ease-out — except during a drag, where it tracks the cursor 1:1
+  with no animation (the rapid-restart on every `onChanged` was
+  freezing the animation at its slow-start).
+- A vertical "wall" marker shows the active setpoint, with the RPM
+  label rendered below the bar so the user can always read it:
+  - **Amber** when the user is dragging or the fan is in `.constant`
+    mode. Label: `"3500 RPM"`.
+  - **Cyan** when the fan is in `.sensorBased` mode. Label:
+    `"→ 3500 RPM"` (`→` indicates the value is dynamic — the SMC layer
+    re-computes the target from the live sensor reading every tick).
+
+`DragGesture(minimumDistance: 0)` is attached to the entire gauge
+including a `contentShape(Rectangle())` so a tap anywhere along the bar
+commits a constant-RPM write immediately. The deduped onChanged commits
+on every cursor move so the fan tracks live as you drag.
+
+### Per-fan modal (`FanControlSheet`)
+
+Three modes:
+
+1. **Automatic** — `.auto`. Writes `Ftst = 0` + `F\(i)Md = 0`, returning
+   control to thermalmonitord.
+2. **Constant speed** — `.constant(rpm: Int)`. Goes through the full
+   `unlockFanControl` dance, then `writeRPM(fanIdx:rpm:)`.
+3. **Sensor-based** — `.sensorBased(sensorId: String, lowTempC: Double,
+   highTempC: Double)`. Host-driven: every polling tick, AppState reads
+   the named sensor, computes `lerp(minRPM, maxRPM, t)` where
+   `t = (currentTemp - lowTempC) / (highTempC - lowTempC)`, and pushes
+   the resulting RPM to `F\(i)Tg`. (The SMC firmware doesn't know about
+   our sensor mode — to it, we're just writing constants at 1 Hz.)
+
+The sensor picker now lists every sensor with its **live temperature**
+on the right side of each menu row, so the user can pick the right one
+without leaving the modal.
+
+The LIVE PREVIEW card has a Swift Chart of the ramp curve:
+- Cyan piecewise-linear line: clamps at minRPM before `lowTempC`, ramps
+  to maxRPM at `highTempC`, clamps again past it; with a gradient
+  AreaMark underneath for visual mass.
+- Green anchor dot at `(lowTempC, minRPM)`, red anchor dot at
+  `(highTempC, maxRPM)`, both labeled.
+- Amber dashed `RuleMark` at the current sensor reading, with a glowing
+  PointMark on the curve at the projected RPM, annotated with both
+  `"X.X °C"` and `"→ N RPM"`.
+
+Multi-point curves (drag points around the chart to define an arbitrary
+ramp) are a planned follow-up — requires `FanMode.sensorBased` to carry
+`[(Double, Int)]` instead of two anchors.
+
+---
+
+## Concurrency model
+
+`AppState` is `@MainActor`. SMC reads + writes can sleep for several
+seconds (the `Ftst` dance, helper socket round-trips), so doing them
+synchronously would freeze the cursor.
+
+The fix: a dedicated serial `DispatchQueue`:
+
+```swift
+private nonisolated let smcQueue = DispatchQueue(
+    label: "dev.foltyn.genesis-fan-control.smc",
+    qos: .userInitiated
+)
+```
+
+Both `tick()` (the 1 Hz polling timer) and `setMode(...)` dispatch their
+SMC work onto this queue, then hop back to MainActor to publish the
+result. `setMode` is fire-and-forget:
+
+1. **Optimistic UI** (MainActor) — update `fan.mode`, `fan.targetRPM`,
+   `fan.currentRPM` immediately so the gauge tracks the user's intent
+   while the write is in flight. `writeInFlight = true`.
+2. **Queue** — `smcQueue.async { smc.setMode(...) → smc.refresh() →
+   smc.snapshot() }`.
+3. **Reconcile** (MainActor) — when the write returns, publish the
+   real snapshot. If the kernel rejected (`ok == false`), set
+   `needsElevation = true` so the banner re-appears. `writeInFlight =
+   false`.
+
+`SMCService` is marked `Sendable`; concrete classes use `@unchecked
+Sendable` because their mutable cache is guarded by the queue.
+
+---
+
+## Build system
+
+### Three layers
+
+1. **`swift build`** — produces three binaries in `.build/<config>/`:
+   `GenesisFanControl`, `genesis-fan-control-helper`, `fans`.
+2. **`bun run scripts/install.ts`** — builds in release mode, then sets
+   up a proper `.app` bundle at `/Applications/GenesisFanControl.app/`
+   with `Contents/MacOS/{GenesisFanControl, genesis-fan-control-helper}`
+   as **symlinks** into `.build/release/` and a proper Info.plist with
+   `CFBundleIconFile=AppIcon`. Also symlinks
+   `/usr/local/bin/fans → .build/release/fans` (one-time sudo prompt).
+3. **`bun run dev`** — watches `Sources/` for `*.swift` changes via
+   `fs.watch` and triggers the install pipeline on each save (debounced
+   200 ms). Equivalent to `vite dev`.
+
+Because the .app's binaries are symlinks, every `swift build` is
+**instantly** reflected in `/Applications/`. No copies needed. macOS
+honors symlinks inside `.app` bundles fine (LaunchServices follows them
+for the main executable).
+
+### Why a release `.app` instead of running `.build/debug/` directly?
+
+Three reasons:
+- A proper `.app` shows up in Spotlight, the Dock when launched, and
+  the ⌘-Tab switcher with the right name and icon.
+- `cmd+Tab` activation requires `.regular` activation policy, which our
+  `AppDelegate` already promotes on `windowDidBecomeKey` — but the OS
+  also has to recognize the binary as a "real" app, which it doesn't
+  for a bare `swift run` output. The `.app` wrapper fixes that.
+- The AppIcon (`scripts/build-icon.swift` → SF Symbol `fanblades.fill`
+  → 10-resolution `.iconset` → `iconutil` → `.icns`) only renders when
+  bundled in `Contents/Resources/`.
+
+### Scripts
+
+| Script | Effect |
+|---|---|
+| `bun run build` | `swift build -c release` |
+| `bun run build:debug` | `swift build` |
+| `bun run start` | Build release + install .app + restart |
+| `bun run start:debug` | Build debug + install .app + restart |
+| `bun run dev` | Watch mode; rebuilds + restarts on save |
+| `bun run icon` | Regenerate `scripts/AppIcon.icns` |
+| `bun run test` | `swift test` (99 cases, ~0.5 s) |
+| `bun run clean` | `swift package clean` |
+| `bun run uninstall:app` | Remove .app + CLI symlink + helper daemon |
+
+---
+
+## CLI
+
+`fans` is a tiny wrapper around `AppleSMCService` directly — it doesn't
+go through the helper at all. Reads are unprivileged; writes need
+`sudo`. (Or, run it through the helper by piping JSON into
+`/var/run/genesis-fan-control.sock` — see `HelperProtocol.swift`.)
+
+```
+fans <command>
+
+  list                                          fans + sensors
+  get <fanID>                                   detail
+  sensors                                       all sensors
+  sensor <sensorID>                             detail
+  set <fanID> auto                              release
+  set <fanID> const <rpm>                       constant
+  set <fanID> sensor <sensorID> <lo> <hi>       sensor-based
+  watch [intervalSec]                           tail readings
+```
+
+The binary lives at `.build/release/fans`; `/usr/local/bin/fans` is a
+symlink to it, so once installed it's globally available — and every
+`bun run start` updates it transparently because the symlink target's
+content changes.
+
+---
 
 ## Logging
 
-Verbatim port of TimeTravel's `Log` + `GFCLogger` (renamed from `TTLogger`) + `LogStore`:
-- `Log.app.info("…")`, `Log.smc.debug("…")`, etc. — categories are `app / ui / settings / smc / fans / sensors / lifecycle`.
-- All logs go to `os.Logger` (visible via `log stream --predicate 'subsystem == "dev.foltyn.genesis-fan-control"'`) AND to an in-memory ring buffer that the in-app Logs panel renders.
-- Crash debugging: enable the `os_log` subsystem in Console.app, filter on `dev.foltyn.genesis-fan-control`.
+Mirrors TimeTravel's double-sink design:
+
+- `Log.app.info(...)`, `.smc.debug(...)`, `.fans.error(...)`,
+  `.sensors.*`, `.ui.*`, `.settings.*`, `.lifecycle.*` — seven
+  categories under one subsystem.
+- Every call writes to **both** `os.Logger` (subsystem
+  `dev.foltyn.genesis-fan-control`, visible via `log stream`) AND an
+  in-memory `LogStore.shared` ring buffer (1000 entries) backing an
+  in-app Logs panel.
+- `.public` privacy is explicit on every interpolation so unified-log
+  output is legible without enabling Apple's private-logging entitlement.
+
+To tail in a terminal:
+
+```bash
+log stream --predicate 'subsystem == "dev.foltyn.genesis-fan-control"' --level debug
+```
+
+---
+
+## Testing
+
+`swift test` runs 99 XCTest cases in ~0.5 s across 6 files:
+
+- **SMCModelsTests** (24) — `Fan.loadFraction` boundaries, `loadColor`
+  thresholds, fahrenheit conversion, formatted() across all
+  fahrenheit×precise combos, `SensorKind.sfSymbol` non-empty, full
+  Codable round-trip for `SensorKind`, `FanMode`, `Fan`, `TempSensor`.
+- **MockSMCServiceTests** (13) — inventory shape, RPM convergence,
+  clamping, unknown-fan no-op, sensor drift bounded, mode flips land
+  in snapshot.
+- **LogStoreTests** (21) — ring buffer caps at 1000 + evicts oldest,
+  per-category filtering, `LogFilter` AND composition, exportText /
+  exportJSON shape, `LogLevel.Comparable`.
+- **LogProxyTests** (6) — `Log.*` routes hit `LogStore.shared` after a
+  50 ms tick.
+- **SettingsStoreTests** (21) — fresh-suite defaults, per-property
+  round-trip via UUID-named UserDefaults suites (per test), raw-key
+  shapes, JSON-encoded menu-bar sensor IDs.
+- **AppStateTests** (14) — initial population, `lastUpdated` distantPast
+  until first tick, `setMode` round-trip in published `fans`,
+  `headlineSensor` is the hottest CPU, `stopPolling()` idempotent.
+
+Singletons are reset / avoided per-test: `LogStore.shared.clear()` in
+setUp/tearDown; `SettingsStore(defaults:)` over UUID-named UserDefaults
+suites; `AppState(smc:autoStartPolling:false)` for AppState tests.
+
+The real `AppleSMCService` is **not** unit-tested — it talks to the
+kernel, so the test fixture would have to mock IOKit. A CLI smoke test
+in `bun run test:smoke` (planned) would do `fans list` and assert the
+RPM count > 0.
+
+---
+
+## Known limitations
+
+(Sorted by severity.)
+
+1. **Multi-point ramp curve not implemented.** `FanMode.sensorBased`
+   carries only `(lowTempC, highTempC)`. Real users want
+   `[(temp, rpm)]` so they can build a fan curve like "30°C → 1500 RPM,
+   60°C → 2500 RPM, 75°C → max". Requires a model change plus a
+   draggable-point editor on the existing Swift Chart.
+2. **Socket auth.** `/var/run/genesis-fan-control.sock` is 0666 with no
+   peer identity check. Any local process can crank fans. Fix: chmod
+   0660 + setgid to a `_fancontrol` group; OR `getpeereid()` +
+   console-user check; OR migrate to `NSXPCConnection` with a code
+   signature anchor.
+3. **Unsigned helper.** No team ID embedded in either binary. The
+   modern Apple way is `SMAppService.daemon(plistName:)` which requires
+   a signed `.app` bundle with the helper at
+   `Contents/Library/LaunchDaemons/<bundle-id>.plist`. Migration plan:
+   wrap the SPM output in an `.app` produced by a tiny Xcode workspace
+   that consumes the SPM package, then ship via Sparkle.
+4. **Missing M3/M4 sensor keys.** Our candidate-sensor list is
+   M1/M2-era — performance/efficiency cores under `Tp` prefix, GPU
+   under `Tg`. M3/M4 add `Te?? / Tf??` prefixes for some sensors that
+   we'd otherwise see. See the research note for the full table.
+5. **No `Ftst` cleanup on app quit.** If the user has a fan in constant
+   mode and quits via cmd-Q, `Ftst` stays at 1 (manual mode held).
+   thermalmonitord eventually undoes it (~minutes), but we should set
+   `Ftst = 0` for each manually-controlled fan in
+   `applicationShouldTerminate`.
+6. **Helper auto-update is manual.** If you rebuild via `bun run start`,
+   the new helper binary is sitting in `/usr/local/sbin/` but the
+   daemon is still running the old in-memory copy. `launchctl kickstart
+   -k system/<label>` would restart it; we don't run that on rebuild.
+   Mitigation: `bun run uninstall:app` + `bun run start` to fully
+   recycle.
+7. **Mock fallback is silent.** If `AppleSMCService.init?()` fails
+   (e.g. running on a sandboxed CI), AppState silently falls back to
+   `MockSMCService` and the user only knows because the backend pill in
+   the status bar says "MockSMC · SIM" in amber. A more obvious
+   "AppleSMC unreachable — running synthetic data" banner would be
+   kinder.
+8. **No in-app log viewer yet.** `LogStore.shared` collects entries but
+   nothing in the UI renders them. The plan was a "Logs" tab in
+   Settings.
+
+---
+
+## Future work
+
+- **Multi-point ramp curve.** Most-requested feature next.
+- **Privileged helper via SMAppService.** Needs an `.app` bundle layout
+  (probably an Xcode workspace that wraps the SPM package) + a paid
+  developer ID for signing.
+- **Code-signature peer-identity check on the socket.** Tear out the
+  Unix socket, replace with `NSXPCConnection` machService, validate
+  `auditToken` against an expected signing identity. Needs SMAppService
+  anyway, so couple it with the previous point.
+- **Sparkle for OTA updates.**
+- **Localization.** The UI is English-only; the original Macs Fan
+  Control screenshots were Czech. The settings strings should move into
+  a String Catalog.
+- **Hardware-specific sensor catalog.** Detect chip
+  (`sysctl machdep.cpu.brand_string`) and pick the right candidate
+  sensor list per family.
+- **Per-fan profile presets.** "Silent / Balanced / Performance" with
+  one-click switching, stored in `SettingsStore`.
+- **Headless mode for the CLI.** `fans daemon` mode that runs a
+  user-level loop applying a curve from a YAML config file — useful for
+  servers / setups where the GUI shouldn't be loaded.
+- **Sensor history graph.** A 10-minute sparkline per sensor in the
+  right rail, replacing the current point reading.
+
+---
+
+## Sources & research
+
+The wire-protocol details, the Ftst dance, and the M-series key tables
+all came from a parallel research pass over open-source projects:
+
+- [exelban/stats](https://github.com/exelban/stats) — canonical Swift
+  SMC bridge with Apple Silicon support; we copied the `unlockFanControl`
+  sequence almost verbatim. `SMC/smc.swift:566-602`.
+- [beltex/SMCKit](https://github.com/beltex/SMCKit) — the original 2014
+  Swift SMC wrapper; everyone since starts from this struct layout.
+- [hholtmann/smcFanControl](https://github.com/hholtmann/smcFanControl)
+  — Objective-C predecessor; canonical install/uninstall pattern.
+- [AlDente](https://github.com/davidwernhart/AlDente),
+  [BatFi](https://github.com/rurza/BatFi),
+  [bclm](https://github.com/zackelia/bclm) — Swift battery tools using
+  the same SMC struct, useful as cross-checks on the type-tag set.
+
+The full research write-up with line numbers + commit SHAs lives in the
+Obsidian vault at
+`~/Tresors/Projects/GenesisBrain/GenesisTools/Fans/Research-2026-06-29.md`.
