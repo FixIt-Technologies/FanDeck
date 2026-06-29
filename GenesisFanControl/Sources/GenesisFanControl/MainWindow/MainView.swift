@@ -168,7 +168,7 @@ struct MainView: View {
             ?? (outdated.map { "The helper running as root is build v\($0.installed); this GUI expects v\($0.current). Click Update to re-install with the latest fixes (you'll be asked for your admin password)." }
                 ?? "Click Install to add a tiny root daemon (you'll be asked for your admin password). After that the app drives fans without sudo.")
         let buttonLabel = outdated != nil ? "Update Helper" : "Install Helper"
-        VStack {
+        return VStack {
             Spacer()
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: installing ? "hourglass" : (outdated != nil ? "arrow.triangle.2.circlepath.circle.fill" : "lock.shield.fill"))
