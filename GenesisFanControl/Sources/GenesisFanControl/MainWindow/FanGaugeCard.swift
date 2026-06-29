@@ -115,6 +115,9 @@ struct DraggableRPMGauge: View {
 
                 // Live RPM fill — during drag we drive it directly from the
                 // cursor so it tracks 1:1; otherwise we animate to fan.currentRPM.
+                // Shadow is kept tight (radius 2) so at high RPM the soft
+                // colored glow doesn't extend past the SetpointWall and
+                // make the bar look like it overshoots the manual target.
                 Capsule()
                     .fill(
                         LinearGradient(
@@ -125,7 +128,7 @@ struct DraggableRPMGauge: View {
                     )
                     .frame(width: max(8, geo.size.width * CGFloat(displayedFraction)),
                            height: height)
-                    .shadow(color: fan.loadColor.opacity(0.45), radius: 6)
+                    .shadow(color: fan.loadColor.opacity(0.3), radius: 2)
                     .animation(isDragging ? nil : .easeOut(duration: 1.0),
                                value: displayedFraction)
 

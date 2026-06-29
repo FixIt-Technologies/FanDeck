@@ -83,9 +83,22 @@ struct SensorPanel: View {
     private var filteredSensors: [TempSensor] {
         appState.sensors.filter { s in
             switch s.kind {
-            case .storage: return settings.includeSATANVMe
-            case .gpu:     return settings.includeEGPU
-            default:       return true
+            case .storage:
+                if !settings.includeSATANVMe { return false }
+                // Thunderbolt-attached external storage exposes via Tt-
+                // prefix SMC keys; internal NVMe is TH0* on Apple Silicon
+                // and TM* / TR* / SSD* on Intel. When the user turns off
+                // "include external drives" we drop anything that looks
+                // Thunderbolt-attached. On a machine with no externals
+                // connected this filter is a no-op — that's expected.
+                if !settings.includeExternalDrives && s.id.hasPrefix("Tt") {
+                    return false
+                }
+                return true
+            case .gpu:
+                return settings.includeEGPU
+            default:
+                return true
             }
         }
     }
