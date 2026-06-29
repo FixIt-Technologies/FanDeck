@@ -145,19 +145,27 @@ struct DraggableRPMGauge: View {
             .frame(height: height)
             .contentShape(Rectangle())
             .gesture(
+                // Drag updates LOCAL `dragRPM` on every onChanged (gives
+                // 1:1 visual tracking under the cursor) but DOES NOT call
+                // onSetManual until onEnded. A slow drag across the gauge
+                // used to fire dozens of SMC writes per second — a single
+                // commit on release is what every other fan-control app
+                // does, and the SetpointWall keeps the visual feedback
+                // honest in between (review MED — "drag gesture fires
+                // SMC write per pixel"). Click-to-pin still works because
+                // a tap is a 0-length drag that ends immediately.
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
                         isDragging = true
                         let rpm = rpmFor(x: g.location.x, totalWidth: geo.size.width)
-                        // Only commit if it actually changed — avoids redundant
-                        // republishes during fine sub-pixel drags.
-                        if dragRPM != rpm {
-                            dragRPM = rpm
-                            onSetManual(rpm)
-                        }
+                        if dragRPM != rpm { dragRPM = rpm }
                     }
                     .onEnded { g in
                         let rpm = rpmFor(x: g.location.x, totalWidth: geo.size.width)
+                        // Commit ONCE on release — the SMC write + Apple
+                        // Silicon Ftst dance takes ~3s in the worst case,
+                        // so per-pixel writes were genuinely wasteful and
+                        // would back up smcQueue with stale targets.
                         onSetManual(rpm)
                         // Clear dragRPM right away — fan.mode is .constant(rpm:) now,
                         // so `activeManualRPM()` already returns the right value.

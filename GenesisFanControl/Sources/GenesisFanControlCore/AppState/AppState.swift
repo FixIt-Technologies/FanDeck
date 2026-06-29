@@ -39,8 +39,14 @@ public final class AppState: ObservableObject {
     /// installed version vs. current).
     @Published public private(set) var helperHealth: HelperClient.Health = .down
     /// True while at least one SMC write is in flight — UI can show a
-    /// spinner / disable controls if it wants.
+    /// spinner / disable controls if it wants. Backed by a counter, not
+    /// a Bool, so overlapping writes (rapid clicks, drag commit + final
+    /// click) don't flicker the indicator off mid-batch (review MED —
+    /// "writeInFlight toggles false before queued writes drain").
     @Published public private(set) var writeInFlight: Bool = false
+    private var inFlightCount: Int = 0 {
+        didSet { writeInFlight = inFlightCount > 0 }
+    }
 
     public nonisolated let helperClient = HelperClient()
     public nonisolated let smc: SMCService
@@ -134,12 +140,19 @@ public final class AppState: ObservableObject {
     }
 
     /// Per-fan intent captured by `applyOptimisticMode` and cleared once
-    /// the corresponding setMode write completes. Read on the main actor
-    /// only.
+    /// the corresponding setMode write completes. Token-versioned so a
+    /// click on fan F0 doesn't wipe a still-in-flight intent for fan F1,
+    /// AND so click B's completion doesn't blow away click A's intent
+    /// when A's setMode completes after B's enqueue (review MED — "multi-
+    /// click setMode race wipes pendingIntent"). Only the writer holding
+    /// the current per-fan token may clear it.
     private var pendingIntent: [String: PendingIntent] = [:]
+    private var intentTokens: [String: UInt64] = [:]
+    private var nextIntentToken: UInt64 = 1
     private struct PendingIntent {
         let mode: FanMode
         let targetRPM: Int?
+        let token: UInt64
     }
 
     public func installHelper() {
@@ -173,8 +186,8 @@ public final class AppState: ObservableObject {
     /// the kernel rejected the write, the optimistic state is overwritten
     /// with reality and the elevation banner is raised.
     public func setMode(_ mode: FanMode, for fanID: String) {
-        applyOptimisticMode(mode, for: fanID)
-        writeInFlight = true
+        let myToken = applyOptimisticMode(mode, for: fanID)
+        inFlightCount += 1
         // Stamp the max-hold clock — AppDelegate's watchdog listens
         // for this and auto-reverts fans held in non-auto for >30 min.
         // Sent for every user-driven setMode (including .auto, which
@@ -196,14 +209,17 @@ public final class AppState: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if !ok { self.needsElevation = true }
-                // The SMC cache has been updated by setMode, so primeSnapshot
-                // returns the user's intent for this fan. Clear the pending
-                // intent entry BEFORE publishing — if we still had it, the
-                // merge would overwrite with stale-yet-identical data, no
-                // harm but unnecessary work.
-                self.pendingIntent.removeValue(forKey: fanID)
+                // Only clear the pendingIntent entry if WE'RE still the
+                // latest writer for this fan. A faster subsequent click
+                // (B) would have replaced our token (A) before we got
+                // here; clearing then would discard B's still-in-flight
+                // intent and republish A's old SMC snapshot to the UI.
+                if self.intentTokens[fanID] == myToken {
+                    self.pendingIntent.removeValue(forKey: fanID)
+                    self.intentTokens.removeValue(forKey: fanID)
+                }
                 self.publish(snapshot: snap)
-                self.writeInFlight = false
+                self.inFlightCount = max(0, self.inFlightCount - 1)
             }
         }
     }
@@ -214,24 +230,35 @@ public final class AppState: ObservableObject {
     /// snapshot that lands between now and write-completion is merged with
     /// the user's intent (otherwise the UI flickers back to whatever the
     /// firmware reports — typically the previous setpoint).
-    private func applyOptimisticMode(_ mode: FanMode, for fanID: String) {
-        guard let i = fans.firstIndex(where: { $0.id == fanID }) else { return }
+    ///
+    /// Returns the monotonic per-fan token assigned to THIS intent. The
+    /// caller (setMode) passes it into the completion handler so a
+    /// later click on the same fan can supersede earlier ones cleanly.
+    @discardableResult
+    private func applyOptimisticMode(_ mode: FanMode, for fanID: String) -> UInt64 {
+        let token = nextIntentToken
+        nextIntentToken &+= 1
+        intentTokens[fanID] = token
+        guard let i = fans.firstIndex(where: { $0.id == fanID }) else {
+            return token
+        }
         let intent: PendingIntent
         switch mode {
         case .auto:
             fans[i].mode = .auto
-            intent = PendingIntent(mode: .auto, targetRPM: nil)
+            intent = PendingIntent(mode: .auto, targetRPM: nil, token: token)
         case .constant(let rpm):
             let clamped = max(fans[i].minRPM, min(fans[i].maxRPM, rpm))
             fans[i].mode = .constant(rpm: clamped)
             fans[i].targetRPM = clamped
             fans[i].currentRPM = clamped
-            intent = PendingIntent(mode: .constant(rpm: clamped), targetRPM: clamped)
+            intent = PendingIntent(mode: .constant(rpm: clamped), targetRPM: clamped, token: token)
         case .sensorBased:
             fans[i].mode = mode
-            intent = PendingIntent(mode: mode, targetRPM: nil)
+            intent = PendingIntent(mode: mode, targetRPM: nil, token: token)
         }
         pendingIntent[fanID] = intent
+        return token
     }
 
     // MARK: - Convenience lookups

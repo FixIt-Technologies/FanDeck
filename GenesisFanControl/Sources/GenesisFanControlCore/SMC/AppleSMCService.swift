@@ -685,6 +685,15 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
                 if let s = newSensors.first(where: { $0.id == sid }) {
                     target = rpmForTemp(s.celsius, fan: fan, points: pts)
                 } else {
+                    // Sensor disappeared (USB temp probe unplugged, virtual
+                    // aggregate degenerated because all cores dropped out,
+                    // etc.). Leaving the fan in CONSTANT-unlocked at a
+                    // stale targetRPM is genuinely dangerous — the chip
+                    // is no longer being controlled by anything observing
+                    // temperature. Drop it back to AUTO and update the
+                    // cached mode so the UI reflects reality.
+                    Log.fans.warning("Fan \(fan.id) sensor '\(sid)' missing from snapshot — falling back to AUTO")
+                    _ = setMode(.auto, for: fan.id)
                     target = nil
                 }
             case .constant(let rpm):
