@@ -63,23 +63,27 @@ struct SensorPanel: View {
                 .foregroundColor(.gfcTextMuted)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-            // SettingsLink looks like the right tool, but in a hidden-
-            // title-bar + ScrollView header it intermittently swallows
-            // its click. NSApp.sendAction("showSettingsWindow:") is the
-            // older AppKit selector that the Settings scene installs on
-            // the responder chain — it just works regardless of activation
-            // policy or window chrome state.
-            Button {
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-            } label: {
-                Image(systemName: "gearshape.fill")
-                    .font(.system(size: 12))
-                    .foregroundColor(.gfcTextSecondary)
-                    .contentShape(Rectangle())
-                    .frame(width: 18, height: 18)
+            // The header sits in the safe-area-ignored region (0..28pt =
+            // the hidden title-bar zone), which is a window-drag handle by
+            // default — AppKit eats button clicks there before SwiftUI
+            // sees them. NoDragArea wraps the gear in an NSView whose
+            // mouseDownCanMoveWindow returns false, so clicks reach the
+            // Button. Tap target is also a chunky 24pt rather than 12pt
+            // so the user doesn't have to pixel-hunt.
+            NoDragArea {
+                Button {
+                    NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                } label: {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.gfcTextSecondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open Settings (⌘,)")
             }
-            .buttonStyle(.plain)
-            .help("Open Settings (⌘,)")
+            .frame(width: 24, height: 24)
         }
         .padding(.horizontal, 12)
         // Same height as the topStatusBar — TEMPERATURES sits on the

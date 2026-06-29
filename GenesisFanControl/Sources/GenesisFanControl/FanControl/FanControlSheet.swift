@@ -182,25 +182,20 @@ struct FanControlSheet: View {
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(.gfcText)
                     // Menu (not Picker) — macOS Picker's pop-up renders each
-                    // entry through NSMenuItem.title (plain text), so any
-                    // HStack/Spacer/secondary Text inside the ForEach gets
-                    // collapsed to the leading label only. Menu+Button keeps
-                    // the SwiftUI hierarchy intact so we can show the live
-                    // temperature on the right of each row.
+                    // entry through NSMenuItem.title which is a single
+                    // string. Even a Menu+Button label collapses to the
+                    // first Text it finds, so any "name [Spacer] temp"
+                    // HStack drops the trailing temp. Concatenate the temp
+                    // into the Label's title string instead — that's what
+                    // actually lands in the menu item.
                     Menu {
                         ForEach(appState.sensors) { s in
                             Button {
                                 sensorID = s.id
                             } label: {
                                 let temp = s.formatted(useFahrenheit: settings.useFahrenheit, precise: false)
-                                HStack(spacing: 8) {
-                                    Image(systemName: s.kind.sfSymbol)
-                                    Text(s.name)
-                                    Spacer(minLength: 12)
-                                    Text(temp)
-                                        .monospacedDigit()
-                                        .foregroundColor(.secondary)
-                                }
+                                Label("\(s.name)   ·   \(temp)",
+                                      systemImage: s.kind.sfSymbol)
                             }
                         }
                     } label: {

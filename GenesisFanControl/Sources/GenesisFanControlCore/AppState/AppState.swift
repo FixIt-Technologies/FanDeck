@@ -78,13 +78,38 @@ public final class AppState: ObservableObject {
             let isUp = helperClient.ping()
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.fans = snap.fans
-                self.sensors = snap.sensors
-                self.lastUpdated = Date()
+                self.publish(snapshot: snap)
                 if isUp != self.helperAvailable { self.helperAvailable = isUp }
                 if isUp { self.needsElevation = false }
             }
         }
+    }
+
+    /// Publish a fresh snapshot onto @Published fans/sensors, but FIRST
+    /// merge in any pending user intent (modes the user has just clicked
+    /// in the UI but whose SMC write hasn't completed yet). Without this
+    /// merge, a polling tick that fires between the optimistic UI update
+    /// and the setMode completion publishes the stale SMC snapshot and
+    /// the gauge briefly flickers back to the firmware-clamped target.
+    private func publish(snapshot snap: (fans: [Fan], sensors: [TempSensor])) {
+        var merged = snap.fans
+        for (id, intent) in pendingIntent {
+            guard let i = merged.firstIndex(where: { $0.id == id }) else { continue }
+            merged[i].mode = intent.mode
+            if let t = intent.targetRPM { merged[i].targetRPM = t }
+        }
+        self.fans = merged
+        self.sensors = snap.sensors
+        self.lastUpdated = Date()
+    }
+
+    /// Per-fan intent captured by `applyOptimisticMode` and cleared once
+    /// the corresponding setMode write completes. Read on the main actor
+    /// only.
+    private var pendingIntent: [String: PendingIntent] = [:]
+    private struct PendingIntent {
+        let mode: FanMode
+        let targetRPM: Int?
     }
 
     public func installHelper() {
@@ -129,9 +154,13 @@ public final class AppState: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if !ok { self.needsElevation = true }
-                self.fans = snap.fans
-                self.sensors = snap.sensors
-                self.lastUpdated = Date()
+                // The SMC cache has been updated by setMode, so primeSnapshot
+                // returns the user's intent for this fan. Clear the pending
+                // intent entry BEFORE publishing — if we still had it, the
+                // merge would overwrite with stale-yet-identical data, no
+                // harm but unnecessary work.
+                self.pendingIntent.removeValue(forKey: fanID)
+                self.publish(snapshot: snap)
                 self.writeInFlight = false
             }
         }
@@ -139,21 +168,28 @@ public final class AppState: ObservableObject {
 
     /// Push the requested mode into the published state immediately so the
     /// gauge tracks the user's drag even while the SMC write is still in
-    /// flight. The next post-write snapshot will overwrite this with the
-    /// real SMC state.
+    /// flight. Also captured into `pendingIntent` so any polling-tick
+    /// snapshot that lands between now and write-completion is merged with
+    /// the user's intent (otherwise the UI flickers back to whatever the
+    /// firmware reports — typically the previous setpoint).
     private func applyOptimisticMode(_ mode: FanMode, for fanID: String) {
         guard let i = fans.firstIndex(where: { $0.id == fanID }) else { return }
+        let intent: PendingIntent
         switch mode {
         case .auto:
             fans[i].mode = .auto
+            intent = PendingIntent(mode: .auto, targetRPM: nil)
         case .constant(let rpm):
             let clamped = max(fans[i].minRPM, min(fans[i].maxRPM, rpm))
             fans[i].mode = .constant(rpm: clamped)
             fans[i].targetRPM = clamped
             fans[i].currentRPM = clamped
+            intent = PendingIntent(mode: .constant(rpm: clamped), targetRPM: clamped)
         case .sensorBased:
             fans[i].mode = mode
+            intent = PendingIntent(mode: mode, targetRPM: nil)
         }
+        pendingIntent[fanID] = intent
     }
 
     // MARK: - Convenience lookups
