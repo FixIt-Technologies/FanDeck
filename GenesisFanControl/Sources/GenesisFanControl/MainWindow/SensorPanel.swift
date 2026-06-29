@@ -12,7 +12,6 @@ import GenesisFanControlCore
 struct SensorPanel: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var settings: SettingsStore
-    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -46,31 +45,37 @@ struct SensorPanel: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             Image(systemName: "thermometer.medium")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(.gfcCyan)
+            // No tracking — at 10 pt that adds enough width to wrap
+            // "TEMPERATURES" on a 280-pt-wide panel. Tight is fine.
             Text("TEMPERATURES")
                 .font(.system(size: 10, weight: .bold))
-                .tracking(0.8)
                 .foregroundColor(.gfcTextSecondary)
-            Text("\(filteredSensors.count)")
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: 8)
+            Text(timeAgo(appState.lastUpdated))
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
                 .foregroundColor(.gfcTextMuted)
-            Spacer()
-            Text("Updated \(timeAgo(appState.lastUpdated))")
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                .foregroundColor(.gfcTextMuted)
-            Button { openSettings() } label: {
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            // SettingsLink is the canonical macOS 14+ way to open the
+            // Settings scene. openSettings() from a deep child view is
+            // unreliable — sometimes the Environment doesn't propagate.
+            SettingsLink {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 12))
                     .foregroundColor(.gfcTextSecondary)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("Open Settings (⌘,)")
         }
-        .padding(.horizontal, 14)
-        // Same height as the topStatusBar — so TEMPERATURES sits on the
+        .padding(.horizontal, 12)
+        // Same height as the topStatusBar — TEMPERATURES sits on the
         // same row as the GenesisFanControl pill on the left.
         .frame(height: 28)
     }
