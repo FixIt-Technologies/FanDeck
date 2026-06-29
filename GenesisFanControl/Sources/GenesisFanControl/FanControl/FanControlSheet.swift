@@ -13,7 +13,18 @@ import Charts
 import GenesisFanControlCore
 
 struct FanControlSheet: View {
-    let fan: Fan
+    /// Captured at sheet construction so the editor can survive a fan
+    /// being momentarily absent from `appState.fans`. The LIVE fan
+    /// data (currentRPM, mode after this user's apply, sensor readings)
+    /// is resolved by ID every body pass via `liveFan`. Capturing the
+    /// struct here would freeze it — the gauge's "Currently reported"
+    /// line and the live-cursor on the chart would never move.
+    let fanID: String
+    /// Snapshot of the fan at open time — used ONLY for static metadata
+    /// (name, minRPM, maxRPM, initial mode for state seeding) and as a
+    /// fallback if the fan disappears mid-edit.
+    let initialFan: Fan
+
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
@@ -24,6 +35,12 @@ struct FanControlSheet: View {
     /// N-point ramp curve (N >= 2). Kept sorted-by-tempC at all times so
     /// the chart + interpolation don't have to re-sort on every read.
     @State private var points: [RampPoint]
+
+    /// Live fan data, refreshed every body pass. Falls back to the
+    /// snapshot captured at open time if the polling tick momentarily
+    /// drops the fan out of the published list (rare — sensor probe
+    /// failure etc.). All read-only — user edits stay in @State above.
+    private var fan: Fan { appState.fan(withID: fanID) ?? initialFan }
 
     enum ModeChoice: String, CaseIterable, Identifiable {
         case auto, constant, sensor
@@ -45,7 +62,8 @@ struct FanControlSheet: View {
     }
 
     init(fan: Fan) {
-        self.fan = fan
+        self.fanID = fan.id
+        self.initialFan = fan
         // Defaults for sensor-based mode when the fan is in auto/constant.
         // Lookup order: this fan's saved config → any sibling fan's saved
         // config (so the second fan inherits from the first) → 2-point

@@ -8,31 +8,25 @@
 import SwiftUI
 import GenesisFanControlCore
 
+/// General preferences. Two toggles only — both wired end-to-end:
+/// `openAtLogin` reconciles with SMAppService.mainApp on every change,
+/// `showDockIcon` swaps NSApp activation policy on the fly.
+///
+/// Earlier drafts had "Check for updates at launch" and a language
+/// picker, but no updater shipped and no localization shipped, so the
+/// controls were lying to the user. Removed rather than left as dead
+/// toggles (review HIGH — "Six Settings toggles never read at runtime").
 struct GeneralSettingsTab: View {
     @EnvironmentObject var settings: SettingsStore
-
-    private let languages: [(code: String, name: String)] = [
-        ("en", "English"),
-        ("cs", "Czech (Čeština)"),
-        ("de", "German (Deutsch)"),
-        ("es", "Spanish (Español)"),
-        ("fr", "French (Français)"),
-        ("ja", "Japanese (日本語)"),
-        ("zh", "Chinese (中文)"),
-    ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             SettingsCard(icon: "power", title: "STARTUP & BEHAVIOR", accentColor: .gfcAmber) {
                 VStack(spacing: 2) {
                     SettingsToggleRow(
-                        title: "Auto-start at system login (recommended)",
+                        title: "Auto-start at system login",
+                        subtitle: "Register with macOS so GenesisFanControl launches when you log in",
                         isOn: $settings.openAtLogin
-                    )
-                    Divider().opacity(0.1)
-                    SettingsToggleRow(
-                        title: "Check for updates at launch",
-                        isOn: $settings.checkUpdatesOnLaunch
                     )
                     Divider().opacity(0.1)
                     SettingsToggleRow(
@@ -44,32 +38,6 @@ struct GeneralSettingsTab: View {
                         NotificationCenter.default.post(name: .mfcShowDockIconChanged, object: nil)
                     }
                 }
-            }
-
-            SettingsCard(icon: "globe", title: "LANGUAGE", accentColor: .gfcCyan) {
-                HStack(spacing: 10) {
-                    Text("Language:")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.gfcText)
-                    Picker("", selection: $settings.languageCode) {
-                        ForEach(languages, id: \.code) { l in
-                            Text(l.name).tag(l.code)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: 260)
-
-                    Spacer()
-
-                    Button("Translate…") {
-                        if let url = URL(string: "https://crowdin.com/") {
-                            NSWorkspace.shared.open(url)
-                        }
-                    }
-                    .buttonStyle(.link)
-                    .foregroundColor(.gfcCyan)
-                }
-                .padding(.vertical, 4)
             }
 
             Spacer(minLength: 0)

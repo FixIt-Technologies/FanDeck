@@ -21,11 +21,17 @@
 
 import AppKit
 import SwiftUI
+import Combine
+import ServiceManagement
 import GenesisFanControlCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
+    /// Combine subs for SettingsStore. Holds menu-bar icon re-renders
+    /// (style/fan/sensorIDs), login-item re-registration (openAtLogin),
+    /// and the AppState observer that drives the menu-bar number text.
+    private var settingsBag: Set<AnyCancellable> = []
     /// Holds the pending demote-to-.accessory work item from
     /// `mainWindowWillClose`. Cancelled by `windowDidBecomeKey` if the
     /// user re-opens the window inside the 300 ms grace window so we
@@ -57,6 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         applyActivationPolicy()
         installMenuBarItem()
+        bindMenuBarSettings()
+        applyOpenAtLogin(SettingsStore.shared.openAtLogin)
 
         NotificationCenter.default.addObserver(forName: .mfcShowDockIconChanged,
                                                object: nil, queue: .main) { [weak self] _ in
@@ -253,16 +261,132 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func installMenuBarItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "fanblades.fill",
-                                   accessibilityDescription: "GenesisFanControl")
-            button.image?.isTemplate = true
-            button.imagePosition = .imageLeading
-            button.title = ""
             button.target = self
             button.action = #selector(menuBarClicked(_:))
         }
         self.statusItem = item
+        renderMenuBar()
         Log.ui.debug("Menu-bar status item installed")
+    }
+
+    /// Render the status-item icon + title from current SettingsStore +
+    /// AppState. Called on launch and whenever any of the menu-bar-
+    /// driving knobs changes (icon style, fan readout, sensor IDs) or
+    /// the live snapshot updates (every poll tick).
+    private func renderMenuBar() {
+        guard let button = statusItem?.button else { return }
+        let settings = SettingsStore.shared
+        let state = AppState.shared
+
+        // Icon
+        switch settings.menuBarIconStyle {
+        case .color, .monochrome:
+            let symbol = settings.menuBarIconStyle == .color ? "fanblades.fill" : "fanblades"
+            button.image = NSImage(systemSymbolName: symbol,
+                                   accessibilityDescription: "GenesisFanControl")
+            button.image?.isTemplate = (settings.menuBarIconStyle == .monochrome)
+        case .temperature:
+            // Use a thermometer glyph + headline temp as the title; no
+            // standalone icon body.
+            button.image = NSImage(systemSymbolName: "thermometer.medium",
+                                   accessibilityDescription: "GenesisFanControl")
+            button.image?.isTemplate = true
+        }
+        button.imagePosition = .imageLeading
+
+        // Title (right of the icon). Compose: optional fan readout +
+        // up to two selected sensor temps. Keep it under ~24 chars so
+        // it doesn't blow out the menu bar.
+        var parts: [String] = []
+
+        // Headline temp if user picked .temperature style
+        if settings.menuBarIconStyle == .temperature,
+           let s = state.headlineSensor {
+            parts.append(s.formatted(useFahrenheit: settings.useFahrenheit, precise: false))
+        }
+
+        // Optional fan readout
+        switch settings.menuBarFan {
+        case .none:
+            break
+        case .rpm:
+            if let f = state.fans.first {
+                parts.append("\(f.currentRPM) RPM")
+            }
+        case .percent:
+            if let f = state.fans.first {
+                let pct = Int((f.loadFraction * 100).rounded())
+                parts.append("\(pct)%")
+            }
+        }
+
+        // Up to 2 sensor temps the user selected
+        let pickedIDs = Array(settings.menuBarSensorIDs.prefix(2))
+        for id in pickedIDs {
+            if let s = state.sensor(withID: id) {
+                parts.append(s.formatted(useFahrenheit: settings.useFahrenheit, precise: false))
+            }
+        }
+
+        button.title = parts.isEmpty ? "" : " " + parts.joined(separator: " · ")
+    }
+
+    /// Hook SettingsStore + AppState into renderMenuBar() so every
+    /// relevant change re-renders. Subscriptions are debounced through
+    /// the main run loop's natural coalescing — multiple toggles in the
+    /// same tick still produce a single icon update.
+    private func bindMenuBarSettings() {
+        let settings = SettingsStore.shared
+        let state = AppState.shared
+
+        settings.$menuBarIconStyle
+            .sink { [weak self] _ in self?.renderMenuBar() }
+            .store(in: &settingsBag)
+        settings.$menuBarFan
+            .sink { [weak self] _ in self?.renderMenuBar() }
+            .store(in: &settingsBag)
+        settings.$menuBarSensorIDs
+            .sink { [weak self] _ in self?.renderMenuBar() }
+            .store(in: &settingsBag)
+        settings.$useFahrenheit
+            .sink { [weak self] _ in self?.renderMenuBar() }
+            .store(in: &settingsBag)
+        // Login-item state
+        settings.$openAtLogin
+            .sink { [weak self] enabled in self?.applyOpenAtLogin(enabled) }
+            .store(in: &settingsBag)
+
+        // Live data — re-render when fans/sensors update so the
+        // RPM/percent/temp readouts in the menu bar track reality.
+        state.$fans
+            .sink { [weak self] _ in self?.renderMenuBar() }
+            .store(in: &settingsBag)
+        state.$sensors
+            .sink { [weak self] _ in self?.renderMenuBar() }
+            .store(in: &settingsBag)
+    }
+
+    /// Reconcile the SMAppService.mainApp registration state with the
+    /// user's preference. Best-effort — on macOS < 13 this API doesn't
+    /// exist; we log and move on. Errors (sandbox / signing) are also
+    /// non-fatal — the toggle is convenience, not safety-critical.
+    private func applyOpenAtLogin(_ enabled: Bool) {
+        let service = SMAppService.mainApp
+        do {
+            if enabled {
+                if service.status != .enabled {
+                    try service.register()
+                    Log.lifecycle.info("Login item registered")
+                }
+            } else {
+                if service.status == .enabled || service.status == .requiresApproval {
+                    try service.unregister()
+                    Log.lifecycle.info("Login item unregistered")
+                }
+            }
+        } catch {
+            Log.lifecycle.error("Login-item toggle failed: \(error)")
+        }
     }
 
     @objc private func menuBarClicked(_ sender: Any?) {

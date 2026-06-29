@@ -39,9 +39,7 @@ final class SettingsStoreTests: XCTestCase {
     func testDefaultsOnFreshSuite() {
         let store = SettingsStore(defaults: defaults)
         XCTAssertFalse(store.openAtLogin)
-        XCTAssertTrue(store.checkUpdatesOnLaunch)
         XCTAssertFalse(store.showDockIcon)
-        XCTAssertEqual(store.languageCode, "en")
         XCTAssertTrue(store.includeSATANVMe)
         XCTAssertFalse(store.includeExternalDrives)
         XCTAssertFalse(store.includeEGPU)
@@ -61,25 +59,11 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(b.openAtLogin)
     }
 
-    func testRoundTripCheckUpdatesOnLaunch() {
-        let a = SettingsStore(defaults: defaults)
-        a.checkUpdatesOnLaunch = false
-        let b = SettingsStore(defaults: defaults)
-        XCTAssertFalse(b.checkUpdatesOnLaunch)
-    }
-
     func testRoundTripShowDockIcon() {
         let a = SettingsStore(defaults: defaults)
         a.showDockIcon = true
         let b = SettingsStore(defaults: defaults)
         XCTAssertTrue(b.showDockIcon)
-    }
-
-    func testRoundTripLanguageCode() {
-        let a = SettingsStore(defaults: defaults)
-        a.languageCode = "cs"
-        let b = SettingsStore(defaults: defaults)
-        XCTAssertEqual(b.languageCode, "cs")
     }
 
     func testRoundTripIncludeSATANVMe() {
@@ -164,14 +148,12 @@ final class SettingsStoreTests: XCTestCase {
         store.useFahrenheit = true
         store.menuBarIconStyle = .monochrome
         store.menuBarFan = .rpm
-        store.languageCode = "de"
 
         // Direct UserDefaults reads using the published K constants
         XCTAssertEqual(defaults.bool(forKey: SettingsStore.K.openAtLogin), true)
         XCTAssertEqual(defaults.bool(forKey: SettingsStore.K.useFahrenheit), true)
         XCTAssertEqual(defaults.string(forKey: SettingsStore.K.menuBarIconStyle), "monochrome")
         XCTAssertEqual(defaults.string(forKey: SettingsStore.K.menuBarFan), "rpm")
-        XCTAssertEqual(defaults.string(forKey: SettingsStore.K.languageCode), "de")
     }
 
     func testMenuBarSensorIDsPersistAsJSONData() throws {

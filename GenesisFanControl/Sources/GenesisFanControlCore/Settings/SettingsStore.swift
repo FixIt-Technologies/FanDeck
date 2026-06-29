@@ -81,14 +81,8 @@ public final class SettingsStore: ObservableObject {
     @Published public var openAtLogin: Bool {
         didSet { ud.set(openAtLogin, forKey: K.openAtLogin); Log.settings.info("openAtLogin=\(openAtLogin)") }
     }
-    @Published public var checkUpdatesOnLaunch: Bool {
-        didSet { ud.set(checkUpdatesOnLaunch, forKey: K.checkUpdatesOnLaunch) }
-    }
     @Published public var showDockIcon: Bool {
         didSet { ud.set(showDockIcon, forKey: K.showDockIcon); Log.settings.info("showDockIcon=\(showDockIcon)") }
-    }
-    @Published public var languageCode: String {
-        didSet { ud.set(languageCode, forKey: K.languageCode) }
     }
 
     // MARK: - Temperature sensors
@@ -151,9 +145,7 @@ public final class SettingsStore: ObservableObject {
 
     public enum K {
         public static let openAtLogin = "general.openAtLogin"
-        public static let checkUpdatesOnLaunch = "general.checkUpdatesOnLaunch"
         public static let showDockIcon = "general.showDockIcon"
-        public static let languageCode = "general.languageCode"
         public static let includeSATANVMe = "sensors.includeSATANVMe"
         public static let includeExternalDrives = "sensors.includeExternalDrives"
         public static let includeEGPU = "sensors.includeEGPU"
@@ -170,9 +162,7 @@ public final class SettingsStore: ObservableObject {
     public init(defaults: UserDefaults = .standard) {
         self.ud = defaults
         openAtLogin = ud.object(forKey: K.openAtLogin) as? Bool ?? false
-        checkUpdatesOnLaunch = ud.object(forKey: K.checkUpdatesOnLaunch) as? Bool ?? true
         showDockIcon = ud.object(forKey: K.showDockIcon) as? Bool ?? false
-        languageCode = ud.string(forKey: K.languageCode) ?? "en"
         includeSATANVMe = ud.object(forKey: K.includeSATANVMe) as? Bool ?? true
         includeExternalDrives = ud.object(forKey: K.includeExternalDrives) as? Bool ?? false
         includeEGPU = ud.object(forKey: K.includeEGPU) as? Bool ?? false

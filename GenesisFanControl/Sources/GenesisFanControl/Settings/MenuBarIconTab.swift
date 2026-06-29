@@ -18,13 +18,17 @@ struct MenuBarIconTab: View {
             SettingsCard(icon: "menubar.dock.rectangle.badge.record", title: "MENU-BAR APPEARANCE", accentColor: .gfcCyan) {
                 VStack(spacing: 12) {
                     LabeledRow("Icon:") {
+                        // Picker's pop-up routes each entry through
+                        // NSMenuItem.title (a single String). An
+                        // HStack { Image, Text } only contributes the
+                        // first Text it finds — the icon silently
+                        // vanishes from the dropdown. Label(...).tag()
+                        // is the documented workaround (the same one
+                        // FanControlSheet uses for sensor temps).
                         Picker("", selection: $settings.menuBarIconStyle) {
                             ForEach(MenuBarIconStyle.allCases) { style in
-                                HStack {
-                                    Image(systemName: iconName(for: style))
-                                        .foregroundColor(.gfcCyan)
-                                    Text(style.label)
-                                }.tag(style)
+                                Label(style.label, systemImage: iconName(for: style))
+                                    .tag(style)
                             }
                         }
                         .labelsHidden()
