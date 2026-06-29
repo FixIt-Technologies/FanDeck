@@ -224,6 +224,13 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             Log.fans.error("setMode: invalid fanID '\(fanID)'")
             return false
         }
+        // Per-call request ID so a single user click can be traced from
+        // here through autoReleaseDirect / unlockFanControl / writeRPM,
+        // into the helper if we fall back, and out to the cached-mode
+        // update. Search the unified log / in-app log panel for r=NNN
+        // to follow one click end-to-end.
+        let r = nextRequestID()
+        Log.fans.info("setMode r=\(r) fan=\(fanID) idx=\(idx) mode=\(modeDescription(mode)) hasHelper=\(helperClient != nil)")
         switch mode {
         case .auto:
             // Apple-Silicon-correct release: F0Md MUST be set back to 0
@@ -234,30 +241,34 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             // clicks "Auto", UI optimistically flips to auto, helper
             // returns false, AppState reverts UI to the previous
             // constant ("blink and back to old setting").
-            if autoReleaseDirect(fanIdx: idx) {
-                Log.fans.info("Fan \(fanID) -> AUTO (direct, F0Md=0 then Ftst=0 if last)")
+            if autoReleaseDirect(fanIdx: idx, r: r) {
+                Log.fans.info("setMode r=\(r) fan=\(fanID) AUTO OK (direct)")
                 updateCachedMode(for: fanID, to: .auto)
                 return true
             }
+            Log.fans.warning("setMode r=\(r) fan=\(fanID) AUTO direct failed — trying helper")
             if let helper = helperClient, helper.setMode(.auto, for: fanID) {
-                Log.fans.info("Fan \(fanID) -> AUTO (via helper)")
+                Log.fans.info("setMode r=\(r) fan=\(fanID) AUTO OK (via helper)")
                 updateCachedMode(for: fanID, to: .auto)
                 return true
             }
-            Log.fans.error("Fan \(fanID) AUTO: direct + helper both failed")
+            Log.fans.error("setMode r=\(r) fan=\(fanID) AUTO FAILED — direct + helper both rejected")
             return false
         case .constant(let rpm):
-            if unlockFanControl(fanIdx: idx) && writeRPM(fanIdx: idx, rpm: rpm) {
-                Log.fans.info("Fan \(fanID) -> CONSTANT \(rpm) (direct)")
+            let unlocked = unlockFanControl(fanIdx: idx, r: r)
+            Log.fans.debug("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) unlock=\(unlocked)")
+            if unlocked && writeRPM(fanIdx: idx, rpm: rpm, r: r) {
+                Log.fans.info("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) OK (direct)")
                 updateCachedMode(for: fanID, to: .constant(rpm: rpm), targetRPM: rpm)
                 return true
             }
+            Log.fans.warning("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) direct failed — trying helper")
             if let helper = helperClient, helper.setMode(.constant(rpm: rpm), for: fanID) {
-                Log.fans.info("Fan \(fanID) -> CONSTANT \(rpm) (via helper)")
+                Log.fans.info("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) OK (via helper)")
                 updateCachedMode(for: fanID, to: .constant(rpm: rpm), targetRPM: rpm)
                 return true
             }
-            Log.fans.error("Fan \(fanID) CONSTANT \(rpm): direct + helper both failed")
+            Log.fans.error("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) FAILED — direct + helper both rejected")
             return false
         case .sensorBased:
             // Sensor-based is host-driven (we compute the target RPM from
@@ -266,34 +277,83 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             // tick writeRPM in primeSnapshot() actually moves the fan.
             // Without this, F0Md stayed at 0 (auto) and the firmware
             // ignored every F0Tg write — fan sat at its idle floor.
-            if unlockFanControl(fanIdx: idx) {
+            if unlockFanControl(fanIdx: idx, r: r) {
                 updateCachedMode(for: fanID, to: mode)
-                Log.fans.info("Fan \(fanID) -> SENSOR-BASED (host-driven, unlocked direct)")
+                Log.fans.info("setMode r=\(r) fan=\(fanID) SENSOR OK (host-driven, unlocked direct)")
                 return true
             }
+            Log.fans.warning("setMode r=\(r) fan=\(fanID) SENSOR unlock failed direct — trying helper")
             if let helper = helperClient,
                helper.setMode(.constant(rpm: cachedFans.first(where: { $0.id == fanID })?.targetRPM ?? minSafeRPM(forFan: idx)),
                               for: fanID) {
                 // Helper successfully put us in constant. Switch cached
                 // mode to sensorBased (host loop will drive target).
                 updateCachedMode(for: fanID, to: mode)
-                Log.fans.info("Fan \(fanID) -> SENSOR-BASED (host-driven, via helper)")
+                Log.fans.info("setMode r=\(r) fan=\(fanID) SENSOR OK (host-driven, via helper)")
                 return true
             }
-            Log.fans.error("Fan \(fanID) SENSOR-BASED: failed to unlock fan control (direct + helper)")
+            Log.fans.error("setMode r=\(r) fan=\(fanID) SENSOR FAILED — direct + helper both rejected unlock")
             return false
         }
     }
 
-    /// AUTO release with the "Ftst is global" invariant respected.
-    /// Writes `F\(i)Md = 0` always; only drops `Ftst = 0` when EVERY
-    /// other fan is also back in auto. Otherwise Fan0 going auto would
-    /// silently re-lock the firmware for Fan1's still-constant setpoint,
-    /// and Fan1 would gradually drift away from what the user pinned
-    /// (review MED — "Ftst is global, treated as per-fan").
-    private func autoReleaseDirect(fanIdx: Int) -> Bool {
+    /// Monotonic request id used in fan logs. Wraps trivially; only
+    /// needed for human readability when scanning. Not thread-safe per
+    /// se but setMode/primeSnapshot/per-tick are all funneled through
+    /// AppState's smcQueue (and the helper is single-threaded).
+    private static var _nextReqID: UInt32 = 0
+    @inline(__always)
+    private func nextRequestID() -> UInt32 {
+        Self._nextReqID &+= 1
+        return Self._nextReqID
+    }
+
+    /// Stable, debugger-friendly description of a mode.
+    private func modeDescription(_ m: FanMode) -> String {
+        switch m {
+        case .auto: return ".auto"
+        case .constant(let rpm): return ".constant(\(rpm))"
+        case .sensorBased(let sid, let pts):
+            let edges = pts.map { "\(Int($0.tempC))°→\($0.rpm)" }.joined(separator: ",")
+            return ".sensorBased(\(sid), [\(edges)])"
+        }
+    }
+
+    /// AUTO release with the "Ftst is global" invariant respected and
+    /// READBACK VERIFICATION — writing F0Md=0 returns kSMCSuccess even
+    /// when the firmware silently rejects the write, so we read the key
+    /// back and retry until it actually flips (or give up after a few
+    /// attempts and surface to the caller, which then falls back to the
+    /// helper). This closes the "click AUTO → blinks back to CONSTANT"
+    /// bug that the order-fix alone didn't fully resolve.
+    private func autoReleaseDirect(fanIdx: Int, r: UInt32) -> Bool {
         let mKey = modeKey(forFan: fanIdx)
-        guard writeUInt8(key: mKey, value: 0) else { return false }
+        Log.fans.debug("autoReleaseDirect r=\(r) fan=F\(fanIdx) key=\(mKey) — initial md=\(readDouble(mKey) ?? -1) ftst=\(readDouble("Ftst") ?? -1)")
+
+        // Write F0Md=0, then VERIFY by reading back. The firmware
+        // sometimes acks the write but doesn't actually flip the bit
+        // — readback is the only way to know we genuinely succeeded.
+        var success = false
+        for attempt in 1...5 {
+            let wrote = writeUInt8(key: mKey, value: 0)
+            // 20ms settle before reading — flash propagation isn't
+            // instantaneous on every chip.
+            usleep(20_000)
+            let readback = readDouble(mKey) ?? -1
+            Log.fans.debug("autoReleaseDirect r=\(r) fan=F\(fanIdx) attempt=\(attempt) write=\(wrote) readback=\(readback)")
+            if wrote && readback < 0.5 {
+                success = true
+                break
+            }
+            // Brief backoff before retry.
+            usleep(50_000)
+        }
+        guard success else {
+            Log.fans.error("autoReleaseDirect r=\(r) fan=F\(fanIdx) GAVE UP — \(mKey) didn't flip to 0 after 5 attempts (firmware ignoring; will fall through to helper)")
+            return false
+        }
+        Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) \(mKey)=0 confirmed")
+
         let othersStillConstant = cachedFans.contains { other in
             guard let oi = Int(other.id.dropFirst()), oi != fanIdx else { return false }
             switch other.mode {
@@ -302,15 +362,19 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             }
         }
         if othersStillConstant {
-            Log.fans.debug("Fan \(fanIdx) AUTO: keeping Ftst=1 — other fans still non-auto")
+            Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) keeping Ftst=1 — other fans still non-auto")
             return true
         }
         // Last non-auto fan going home — safe to lower the global lock.
-        if !writeUInt8(key: "Ftst", value: 0) {
+        let ftstOk = writeUInt8(key: "Ftst", value: 0)
+        let ftstReadback = readDouble("Ftst") ?? -1
+        if !ftstOk || ftstReadback >= 0.5 {
             // Direct Ftst write may legitimately fail (firmware bounce) —
             // F0Md=0 is the load-bearing write; Ftst will naturally
             // drift back to 0 on next firmware re-arm. Not fatal.
-            Log.fans.debug("Fan \(fanIdx) AUTO: F0Md=0 ok but Ftst=0 was refused")
+            Log.fans.warning("autoReleaseDirect r=\(r) fan=F\(fanIdx) F0Md=0 ok but Ftst=0 was refused (wrote=\(ftstOk) readback=\(ftstReadback)) — not fatal")
+        } else {
+            Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) Ftst=0 confirmed (last non-auto fan home)")
         }
         return true
     }
@@ -329,42 +393,75 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
 
     /// Apple Silicon firmware silently rejects `F0Md = 1` unless `Ftst`
     /// is unlocked first. Sequence cribbed from exelban/stats SMC.swift.
-    private func unlockFanControl(fanIdx: Int) -> Bool {
+    /// Now READBACK-VERIFIED at each step so a stale-cache or
+    /// firmware-reject doesn't silently return success.
+    private func unlockFanControl(fanIdx: Int, r: UInt32 = 0) -> Bool {
         let mKey = modeKey(forFan: fanIdx)
-        // Fast path: direct mode write (works on Intel + M5+).
-        if writeUInt8(key: mKey, value: 1) { return true }
+        Log.fans.debug("unlockFanControl r=\(r) fan=F\(fanIdx) key=\(mKey) — initial md=\(readDouble(mKey) ?? -1) ftst=\(readDouble("Ftst") ?? -1)")
+
+        // Fast path: direct mode write (works on Intel + M5+). Verify
+        // by readback — kSMCSuccess from writeKey can lie.
+        if writeUInt8(key: mKey, value: 1) {
+            usleep(20_000)
+            let rb = readDouble(mKey) ?? -1
+            if rb >= 1 {
+                Log.fans.info("unlockFanControl r=\(r) fan=F\(fanIdx) FAST PATH ok (\(mKey) readback=\(rb))")
+                return true
+            }
+            Log.fans.debug("unlockFanControl r=\(r) fan=F\(fanIdx) fast path write ack but readback=\(rb) — falling to slow path")
+        }
 
         // Slow path: read Ftst, write it to 1, wait, retry.
         let alreadyUnlocked: Bool
         if let v = readDouble("Ftst") {
             alreadyUnlocked = v >= 1
+            Log.fans.debug("unlockFanControl r=\(r) fan=F\(fanIdx) Ftst=\(v) alreadyUnlocked=\(alreadyUnlocked)")
         } else {
             // No Ftst key — give up; either firmware is locking us out
             // some other way, or we're going through the helper anyway.
+            Log.fans.warning("unlockFanControl r=\(r) fan=F\(fanIdx) no Ftst key — giving up")
             return false
         }
 
         if alreadyUnlocked {
-            for _ in 0..<20 {
-                if writeUInt8(key: mKey, value: 1) { return true }
+            for attempt in 0..<20 {
+                if writeUInt8(key: mKey, value: 1) {
+                    usleep(20_000)
+                    let rb = readDouble(mKey) ?? -1
+                    if rb >= 1 {
+                        Log.fans.info("unlockFanControl r=\(r) fan=F\(fanIdx) ok via Ftst-already-unlocked retry=\(attempt) (\(mKey) readback=\(rb))")
+                        return true
+                    }
+                }
                 usleep(50_000)
             }
+            Log.fans.warning("unlockFanControl r=\(r) fan=F\(fanIdx) Ftst already 1 but \(mKey)=1 still not landing after 20 retries")
             return false
         }
 
         var pushed = false
-        for _ in 0..<100 {
+        for attempt in 0..<100 {
             if writeUInt8(key: "Ftst", value: 1) { pushed = true; break }
+            if attempt == 99 { Log.fans.error("unlockFanControl r=\(r) fan=F\(fanIdx) Ftst=1 write rejected 100 times") }
             usleep(50_000)
         }
         if !pushed { return false }
+        Log.fans.debug("unlockFanControl r=\(r) fan=F\(fanIdx) Ftst=1 pushed; sleeping 3s for thermalmonitord")
 
         // Give thermalmonitord up to 3 s to yield control.
         usleep(3_000_000)
-        for _ in 0..<300 {
-            if writeUInt8(key: mKey, value: 1) { return true }
+        for attempt in 0..<300 {
+            if writeUInt8(key: mKey, value: 1) {
+                usleep(20_000)
+                let rb = readDouble(mKey) ?? -1
+                if rb >= 1 {
+                    Log.fans.info("unlockFanControl r=\(r) fan=F\(fanIdx) ok after Ftst-dance retry=\(attempt) (\(mKey) readback=\(rb))")
+                    return true
+                }
+            }
             usleep(100_000)
         }
+        Log.fans.error("unlockFanControl r=\(r) fan=F\(fanIdx) GAVE UP after full Ftst dance — \(mKey) never went to 1")
         return false
     }
 
@@ -381,16 +478,19 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
     /// it's `fpe2` (2-byte 14.2 fixed-point). Caller-supplied `rpm` is
     /// clamped against the absolute floor BEFORE encoding so no path
     /// (CLI, helper, host re-assertion) can hit zero.
-    private func writeRPM(fanIdx: Int, rpm rawRPM: Int) -> Bool {
+    private func writeRPM(fanIdx: Int, rpm rawRPM: Int, r: UInt32 = 0) -> Bool {
         let rpm = max(Self.absoluteMinSafeRPM, rawRPM)
         if rpm != rawRPM {
-            Log.fans.debug("Clamped F\(fanIdx)Tg write \(rawRPM) → \(rpm) (safety floor)")
+            Log.fans.debug("writeRPM r=\(r) fan=F\(fanIdx) clamped \(rawRPM) → \(rpm) (safety floor)")
         }
         let key = "F\(fanIdx)Tg"
         var info = SMCParamStruct()
         info.key = fourCC(key)
         info.data8 = SMCCall.getKeyInfo.rawValue
-        guard let infoOut = call(input: info) else { return false }
+        guard let infoOut = call(input: info) else {
+            Log.smc.error("writeRPM r=\(r) fan=F\(fanIdx) getKeyInfo(\(key)) FAILED")
+            return false
+        }
 
         var write = SMCParamStruct()
         write.key = fourCC(key)
@@ -416,12 +516,19 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             write.bytes.0 = UInt8(v >> 8)
             write.bytes.1 = UInt8(v & 0xFF)
         default:
-            Log.smc.error("Unsupported \(key) type '\(typeStr)' — refusing to write")
+            Log.smc.error("writeRPM r=\(r) fan=F\(fanIdx) unsupported \(key) type '\(typeStr)' — refusing to write")
             return false
         }
 
-        guard let writeOut = call(input: write) else { return false }
-        return writeOut.result == 0
+        guard let writeOut = call(input: write) else {
+            Log.smc.error("writeRPM r=\(r) fan=F\(fanIdx) IOConnect call returned nil")
+            return false
+        }
+        if writeOut.result != 0 {
+            Log.smc.warning("writeRPM r=\(r) fan=F\(fanIdx) \(key)=\(rpm) (type=\(typeStr)) result=\(writeOut.result)")
+            return false
+        }
+        return true
     }
 
     /// Probes both `F\(i)Md` (uppercase) and `F\(i)md` (lowercase) and
@@ -634,7 +741,18 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             } else {
                 mode = baseMode
                 displayedTarget = Int(target)
+                // Loud canary: cached said AUTO, but SMC says md>=1 →
+                // the firmware did not actually accept the AUTO write
+                // (this is the "blink and back to old setting" bug
+                // surfacing in the readback). The retry in
+                // autoReleaseDirect should have caught it; if we get
+                // here anyway, either the helper succeeded but firmware
+                // reverted, or thermalmonitord re-engaged immediately.
+                if case .auto = existing?.mode, md >= 1 {
+                    Log.fans.warning("primeSnapshot fan=F\(i) anomaly — cached=.auto but SMC \(modeKey(forFan: i))=\(md). Firmware re-locked after AUTO write?")
+                }
             }
+            Log.fans.debug("primeSnapshot fan=F\(i) actual=\(Int(actual)) target=\(Int(target)) md=\(md) → mode=\(modeDescription(mode)) displayedTarget=\(displayedTarget)")
 
             newFans.append(Fan(
                 id: "F\(i)",
@@ -709,8 +827,10 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             // pinned. helperClient.setMode(.constant(...)) wraps a single
             // socket round-trip + unlock-already-succeeded fast path; the
             // cost is in the order of a millisecond per fan per tick.
-            if !writeRPM(fanIdx: fanIdx, rpm: rpm) {
-                _ = helperClient?.setMode(.constant(rpm: rpm), for: fan.id)
+            let direct = writeRPM(fanIdx: fanIdx, rpm: rpm)
+            if !direct {
+                let helperOk = helperClient?.setMode(.constant(rpm: rpm), for: fan.id) ?? false
+                Log.fans.debug("primeSnapshot reassert fan=\(fan.id) target=\(rpm) direct=false helper=\(helperOk)")
             }
         }
     }
@@ -835,8 +955,13 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
     // MARK: - In-memory mode bookkeeping
 
     private func updateCachedMode(for fanID: String, to mode: FanMode, targetRPM: Int? = nil) {
-        guard let i = cachedFans.firstIndex(where: { $0.id == fanID }) else { return }
+        guard let i = cachedFans.firstIndex(where: { $0.id == fanID }) else {
+            Log.fans.debug("updateCachedMode fan=\(fanID) not in cache — no-op")
+            return
+        }
+        let prev = modeDescription(cachedFans[i].mode)
         cachedFans[i].mode = mode
         if let t = targetRPM { cachedFans[i].targetRPM = t }
+        Log.fans.debug("updateCachedMode fan=\(fanID) \(prev) → \(modeDescription(mode))\(targetRPM.map { " target=\($0)" } ?? "")")
     }
 }
