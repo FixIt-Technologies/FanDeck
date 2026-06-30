@@ -32,7 +32,11 @@ public enum HelperConstants {
     /// classify md==3 as auto (firmware-System resting state), settle
     /// window after release. The old helper still does the readback
     /// retry which fails on every M-series Mac — must upgrade.
-    public static let protocolVersion = 4
+    /// v5 (2026-06-30): fix re-entrant dispatch_sync deadlock in the
+    /// watchdog timer — the source was scheduled on stateQueue and its
+    /// handler called stateQueue.sync, crashing libdispatch every ~60s.
+    /// Watchdog now has its own dedicated queue.
+    public static let protocolVersion = 5
 }
 
 public enum HelperRequest: Codable {

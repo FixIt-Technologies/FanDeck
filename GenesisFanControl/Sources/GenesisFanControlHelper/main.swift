@@ -125,8 +125,18 @@ _ = sigterm; _ = sigint   // retain past end of statement
 /// us in >IDLE_REVERT_SECONDS, the GUI is presumed dead — revert. This
 /// is the safety net for a crashed unprivileged process; the SIGTERM
 /// path covers ordered shutdown.
+///
+/// IMPORTANT: the timer source runs on a DEDICATED queue, NOT stateQueue.
+/// If it ran on stateQueue, the handler would already be on stateQueue
+/// when it tries `stateQueue.sync { ... }` to peek at lockedFans —
+/// libdispatch detects the re-entrant dispatch_sync and traps with
+/// "BUG IN CLIENT OF LIBDISPATCH: dispatch_sync called on queue already
+/// owned by current thread", crashing the helper every IDLE_REVERT
+/// interval. Crash signature observed in DiagnosticReports/
+/// genesis-fan-control-helper-2026-06-30-015838.ips.
 let IDLE_REVERT_SECONDS: TimeInterval = 60
-let watchdog = DispatchSource.makeTimerSource(queue: stateQueue)
+let watchdogQueue = DispatchQueue(label: "dev.foltyn.gfc.helper.watchdog")
+let watchdog = DispatchSource.makeTimerSource(queue: watchdogQueue)
 watchdog.schedule(deadline: .now() + 10, repeating: 10)
 watchdog.setEventHandler {
     let (held, last) = stateQueue.sync { (lockedFans, lastActivity) }
