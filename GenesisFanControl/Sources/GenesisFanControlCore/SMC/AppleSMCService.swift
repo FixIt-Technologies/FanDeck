@@ -817,40 +817,93 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         // Real sensors. On Apple Silicon (verified on M4 — sensors
         // jumping 40 ↔ 1.9°C every tick), the firmware writes constant
         // SENTINEL values into per-core SoC sensors when individual
-        // cores power-gate: 1.9°C (Float32 0x3FF33333) and -4.0°C
-        // (Float32 0xC0800000) are the two we've seen. They're not
-        // real temperatures — the cache holds them whenever the core
-        // hasn't woken in the last few ms. Stats / iStat Menus filter
-        // these the same way: any CPU sensor reading < 10°C is
-        // dismissed as ghost and we hold the last valid value.
-        // Off-chip sensors (battery, airport, storage, power) are
-        // never power-gated this way and pass through unchanged.
+        // cores power-gate: 1.9°C (Float32 0x3FF33333), -4.0°C
+        // (Float32 0xC0800000), 0.0°C, and on some firmware revs 40.0°C
+        // (the M4 Mac16,5 "idle floor" — looks legit, never updates).
+        // They're not real temperatures — the cache holds them whenever
+        // the core hasn't woken in the last few ms.
+        //
+        // Two-pass ghost filter:
+        //
+        //   PASS 1: read every readable Tp*/Tg*/off-chip sensor into
+        //           a raw[] array. Read failures and hard out-of-band
+        //           values hold last-valid (or are dropped) right away.
+        //
+        //   GHOST CLUSTER DETECTION: within the Tp* prefix and the
+        //           Tg* prefix SEPARATELY, bucket every raw reading
+        //           to 1/100 °C precision (Int(value * 100)). Any
+        //           bucket with ≥4 members is a power-gated cache
+        //           stamp — real diode reads have ≥0.1 °C of noise
+        //           across cores even at deep idle, so 4 cores hitting
+        //           the same 0.01 °C bucket is astronomically improbable
+        //           in real data. This catches the 40.0 °C sentinel
+        //           (which the old `raw < 10` floor missed entirely).
+        //
+        //   PASS 2: per-sensor — if the key is in a detected ghost
+        //           cluster OR is a sub-10 °C CPU/GPU core reading
+        //           (legacy 1.9 / -4 / 0 sentinels, catches the case
+        //           where only 1 core is gated and the cluster test
+        //           doesn't fire), hold lastValidSensor[key], or omit
+        //           entirely if no prior valid exists. Off-chip sensors
+        //           (battery, airport, storage, power) never ghost and
+        //           pass through unchanged.
+        struct RawReading {
+            let key: String
+            let name: String
+            let kind: SensorKind
+            let c: Double
+        }
         var newSensors: [TempSensor] = []
+        var raw: [RawReading] = []
+        var rawByKey: [String: Double] = [:]
         for (key, name, kind) in sensorKeys {
-            guard let raw = readDouble(key) else {
-                // Read failed — re-publish last good if we have one
-                if let prev = lastValidSensor[key] {
-                    newSensors.append(prev)
-                }
-                continue
-            }
+            guard let v = readDouble(key) else { continue }
             // Hard out-of-band guard (real sensor never reports outside this).
-            guard raw > -20, raw < 130 else {
+            guard v > -20, v < 130 else { continue }
+            raw.append(RawReading(key: key, name: name, kind: kind, c: v))
+            rawByKey[key] = v
+        }
+
+        // Bucket Tp* and Tg* prefixes separately. Any 0.01 °C bucket
+        // with ≥4 members is a power-gated ghost cluster.
+        func clusterGhosts<S: Sequence>(_ readings: S) -> Set<String>
+        where S.Element == RawReading {
+            let arr = Array(readings)
+            guard arr.count >= 4 else { return [] }
+            let buckets = Dictionary(grouping: arr, by: { Int($0.c * 100) })
+            var out: Set<String> = []
+            for (_, members) in buckets where members.count >= 4 {
+                out.formUnion(members.map(\.key))
+            }
+            return out
+        }
+        let ghostKeys: Set<String> =
+            clusterGhosts(raw.lazy.filter { $0.key.hasPrefix("Tp") })
+            .union(clusterGhosts(raw.lazy.filter { $0.key.hasPrefix("Tg") }))
+        if !ghostKeys.isEmpty {
+            Log.smc.warning("Ghost cluster filter suppressed \(ghostKeys.count) sensors: \(ghostKeys.sorted().joined(separator: ",")) — power-gated cache stamp")
+        }
+
+        // Pass 2: emit sensors in original sensorKeys order.
+        for (key, name, kind) in sensorKeys {
+            // Read failure or out-of-band: hold last valid (or omit).
+            guard let v = rawByKey[key] else {
                 if let prev = lastValidSensor[key] {
                     newSensors.append(prev)
                 }
                 continue
             }
-            // Ghost-value filter: CPU/GPU per-core sensors below 10°C
-            // are power-gated cache sentinels, not real readings.
             let isCoreCpu = key.hasPrefix("Tp") || key.hasPrefix("Tg")
-            if isCoreCpu && raw < 10 {
+            let isGhost = ghostKeys.contains(key) || (isCoreCpu && v < 10)
+            if isGhost {
                 if let prev = lastValidSensor[key] {
                     newSensors.append(prev)
                 }
+                // No prior valid → omit entirely (don't seed the cache
+                // with a ghost). Virtual aggregates will exclude it.
                 continue
             }
-            let s = TempSensor(id: key, name: name, kind: kind, celsius: raw)
+            let s = TempSensor(id: key, name: name, kind: kind, celsius: v)
             newSensors.append(s)
             lastValidSensor[key] = s
         }
