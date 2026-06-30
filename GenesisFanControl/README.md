@@ -66,7 +66,7 @@ apps/GenesisFanControl/
 │   │   └── Theme/{Theme,Components}.swift
 │   ├── GenesisFanControlHelper/main.swift   # root daemon
 │   └── fans/main.swift                       # CLI
-└── Tests/GenesisFanControlTests/             # 99 XCTest cases
+└── Tests/GenesisFanControlTests/             # 329 XCTest cases (14 files)
 ```
 
 Four targets, one library:
@@ -569,7 +569,7 @@ Three reasons:
 | `bun run start:debug` | Build debug + install .app + restart |
 | `bun run dev` | Watch mode; rebuilds + restarts on save |
 | `bun run icon` | Regenerate `scripts/AppIcon.icns` |
-| `bun run test` | `swift test` (99 cases, ~0.5 s) |
+| `bun run test` | `swift test` (329 cases, ~6 s) |
 | `bun run clean` | `swift package clean` |
 | `bun run uninstall:app` | Remove .app + CLI symlink + helper daemon |
 
@@ -626,7 +626,11 @@ log stream --predicate 'subsystem == "dev.foltyn.genesis-fan-control"' --level d
 
 ## Testing
 
-`swift test` runs 99 XCTest cases in ~0.5 s across 6 files:
+`swift test` runs **329 XCTest cases** in ~6 s across 14 files. Two layers:
+pure model/store tests against `GenesisFanControlCore`, plus process-logic +
+SwiftUI view-structure tests added with the macOS-14 window-fix work.
+
+**Core models & stores** (the original 6 files, 97 cases):
 
 - **SMCModelsTests** (24) — `Fan.loadFraction` boundaries, `loadColor`
   thresholds, fahrenheit conversion, formatted() across all
@@ -640,12 +644,38 @@ log stream --predicate 'subsystem == "dev.foltyn.genesis-fan-control"' --level d
   exportJSON shape, `LogLevel.Comparable`.
 - **LogProxyTests** (6) — `Log.*` routes hit `LogStore.shared` after a
   50 ms tick.
-- **SettingsStoreTests** (21) — fresh-suite defaults, per-property
+- **SettingsStoreTests** (19) — fresh-suite defaults, per-property
   round-trip via UUID-named UserDefaults suites (per test), raw-key
   shapes, JSON-encoded menu-bar sensor IDs.
 - **AppStateTests** (14) — initial population, `lastUpdated` distantPast
   until first tick, `setMode` round-trip in published `fans`,
   `headlineSensor` is the hottest CPU, `stopPolling()` idempotent.
+
+**Process logic + UI** (8 files, 232 cases). Each executable's pure decision
+logic was extracted into `Core` and the executable rewired to *call* the seam,
+so these tests guard the real code path — not a parallel copy:
+
+- **ActivationPolicyTests** (27) — `ActivationPolicyDecider`: dock-icon→policy,
+  key-window promote, and demote-gating (never demote while the main OR Settings
+  window is still visible).
+- **SettingsDispatchTests** (45) — `SettingsWindowDispatch`: `isSettingsWindow`
+  matching + the `openSettings()` → poll → bounded-legacy-fallback → give-up
+  state machine behind the gear button.
+- **MenuBarRenderTests** (37) — `MenuBarContent`: SF-symbol per icon style, title
+  composition (temp / RPM / percent / sensors), and the byte-identical cache-skip.
+- **WatchdogLifecycleTests** (24) — `MaxHoldDecider`: max-hold revert set and the
+  non-auto filters that drive sleep/wake re-assert and the terminate-revert.
+- **HelperHoldStateTests** (32) — `HelperHoldState` hold/release/re-assert
+  targets + idle-revert, and `HelperPeerAuth` root/console-user gate.
+- **FansCLITests** (48) — `CLIParser`: command + set-spec parsing, every error
+  case, un-clamped const RPM, bare `fans` → usage/exit 0.
+- **ViewStructureTests** + **ViewInspectorProbeTests** (19) — ViewInspector:
+  MainView hit-testing + gear reachability, SensorPanel rows, FanGaugeCard
+  Auto/Configure, FanControlSheet ramp points + apply-to-all.
+
+The test target `@testable import`s the `GenesisFanControl` executable directly
+(its `@main` App struct allows it — no separate UI library needed); ViewInspector
+is a test-only dependency.
 
 Singletons are reset / avoided per-test: `LogStore.shared.clear()` in
 setUp/tearDown; `SettingsStore(defaults:)` over UUID-named UserDefaults
@@ -655,6 +685,11 @@ The real `AppleSMCService` is **not** unit-tested — it talks to the
 kernel, so the test fixture would have to mock IOKit. A CLI smoke test
 in `bun run test:smoke` (planned) would do `fans list` and assert the
 RPM count > 0.
+
+**Not covered by `swift test`:** real on-screen window-surfacing — does the gear
+actually bring the Settings window to the front, does the menu-bar click raise
+the main window. That's AppKit/WindowServer behavior needing XCUITest or a manual
+click; the decision logic *behind* those flows is covered above.
 
 ---
 
@@ -851,6 +886,16 @@ scratch.
 In rough order shipped, newest at top. Full commit messages tell the
 "why" — git log is the source of truth.
 
+- **146d2db** — AppKit/UI + logic test suite: each process's decision logic
+  extracted into `Core` and the executables rewired to call it, so 102→329
+  `swift test` cases now guard the real paths (activation policy, Settings
+  dispatch, menu bar, watchdogs, helper, fans CLI) plus ViewInspector
+  view-structure tests.
+- **9a93ebf** — Window/Settings opening hardened for macOS 14+: gear uses the
+  real `openSettings()` env action (the `showSettingsWindow:` selector was
+  removed in macOS 14), menu-bar click promotes `.regular` +
+  `orderFrontRegardless`, and the policy demote no longer strands a still-open
+  Settings window.
 - **6911ae6** — README rewrite (this section + the others).
 - **11b6a0c** — Gear button finally clickable (ZStack reorder + 
   `.allowsHitTesting(false)` on topStatusBar). Helper protocol
