@@ -80,11 +80,19 @@ struct FanGaugeCard: View {
         return true
     }
 
-    private func formatted(_ n: Int) -> String {
+    // Cached: NumberFormatter is heavyweight to construct, and `formatted`
+    // is called from a body that re-evaluates on every poll tick. Allocating
+    // a fresh formatter per call fed per-frame malloc/ARC churn (Focus C
+    // leaf hot-spots). One shared instance, built once.
+    private static let rpmFormatter: NumberFormatter = {
         let f = NumberFormatter()
         f.numberStyle = .decimal
         f.groupingSeparator = " "
-        return f.string(from: NSNumber(value: n)) ?? "\(n)"
+        return f
+    }()
+
+    private func formatted(_ n: Int) -> String {
+        Self.rpmFormatter.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 }
 
@@ -132,7 +140,13 @@ struct DraggableRPMGauge: View {
                     .frame(width: max(8, geo.size.width * CGFloat(displayedFraction)),
                            height: height)
                     .shadow(color: fan.loadColor.opacity(0.3), radius: 2)
-                    .animation(.easeOut(duration: 1.0), value: displayedFraction)
+                    // 0.25 s, not 1.0 s. At duration ≈ the 1 s poll interval
+                    // the fill never finished easing before the next tick
+                    // moved it again → a continuous per-frame animation loop
+                    // (Focus C). 0.25 s still smooths each step ("fill ramps
+                    // up to meet the target") but lets the gauge rest between
+                    // ticks so the run loop can sleep.
+                    .animation(.easeOut(duration: 0.25), value: displayedFraction)
 
                 // Sensor-based: faint ticks at each ramp vertex's RPM so
                 // the user sees the whole curve's "stops" (the RPM range

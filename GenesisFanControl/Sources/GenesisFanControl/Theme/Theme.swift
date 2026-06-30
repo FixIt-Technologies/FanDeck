@@ -134,18 +134,17 @@ extension View {
 }
 
 struct PulseGlow: ViewModifier {
-    @State private var isAnimating = false
     var color: Color = .gfcAmber
 
+    // Was an `.easeInOut(duration: 2).repeatForever` animation on a blurred
+    // shadow (radius + opacity). Profiling (Focus C `sample`) showed it the
+    // single biggest idle-CPU sink: an always-visible view animating a
+    // shadow forces a Core Animation transaction commit on EVERY display
+    // frame (60–120 fps) — and the radius change re-rasterizes the offscreen
+    // blur each frame, dragging WindowServer up too — even with zero data
+    // change. A static shadow renders once and lets the run loop sleep.
     func body(content: Content) -> some View {
-        content
-            .shadow(color: color.opacity(isAnimating ? 0.4 : 0.2),
-                    radius: isAnimating ? 12 : 8)
-            .onAppear {
-                withAnimation(.easeInOut(duration: 2).repeatForever(autoreverses: true)) {
-                    isAnimating = true
-                }
-            }
+        content.shadow(color: color.opacity(0.3), radius: 10)
     }
 }
 

@@ -28,6 +28,13 @@ import GenesisFanControlCore
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
+    /// Last rendered menu-bar icon symbol + title text. `renderMenuBar()` is
+    /// driven by both `$fans` and `$sensors` (2 calls/tick) and re-runs on
+    /// every poll; these let it bail out when the visible output is
+    /// byte-identical, instead of rebuilding an NSImage + NSAttributedString
+    /// and reassigning the status-item button 2×/sec at idle (Focus B2).
+    private var lastMenuBarSymbol: String?
+    private var lastMenuBarTitle: String?
     /// Combine subs for SettingsStore. Holds menu-bar icon re-renders
     /// (style/fan/sensorIDs), login-item re-registration (openAtLogin),
     /// and the AppState observer that drives the menu-bar number text.
@@ -278,25 +285,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settings = SettingsStore.shared
         let state = AppState.shared
 
-        // Icon. ALWAYS template — the menu bar uses templates so the
-        // glyph is auto-tinted to match light/dark menu-bar background.
-        // The previous `.color` style left isTemplate=false which made
-        // the symbol render as raw black pixels (invisible on dark menu
-        // bars; mis-aligned vertically because non-template images
-        // bypass the standard 22pt baseline). For "color" we use the
-        // fill variant; the actual color comes from the system.
+        // Resolve the SF Symbol name (the image is applied below, after the
+        // cache check). The menu bar always uses TEMPLATE images so the glyph
+        // auto-tints to the light/dark menu-bar background; `.color` uses the
+        // fill variant, the actual color comes from the system.
+        let symbol: String
         switch settings.menuBarIconStyle {
-        case .color, .monochrome:
-            let symbol = settings.menuBarIconStyle == .color ? "fanblades.fill" : "fanblades"
-            button.image = NSImage(systemSymbolName: symbol,
-                                   accessibilityDescription: "GenesisFanControl")
-        case .temperature:
-            // Use a thermometer glyph + headline temp as the title.
-            button.image = NSImage(systemSymbolName: "thermometer.medium",
-                                   accessibilityDescription: "GenesisFanControl")
+        case .color:       symbol = "fanblades.fill"
+        case .monochrome:  symbol = "fanblades"
+        case .temperature: symbol = "thermometer.medium"
         }
-        button.image?.isTemplate = true
-        button.imagePosition = .imageLeading
 
         // Title (right of the icon). Compose: optional fan readout +
         // up to two selected sensor temps. Keep it under ~24 chars so
@@ -332,6 +330,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        let titleText = parts.isEmpty ? "" : " " + parts.joined(separator: " · ")
+
+        // Output cache (Focus B2): skip all NSImage / NSAttributedString
+        // allocation + status-item reassignment when nothing the menu bar
+        // shows has changed. Invoked 2×/tick ($fans + $sensors) with stable
+        // RPM + rounded temps at idle → collapses ~2 byte-identical rebuilds
+        // /sec to ~0. The cached `labelColor` in the existing attributedTitle
+        // still re-resolves on a light/dark appearance switch, so skipping
+        // the rebuild is safe.
+        if symbol == lastMenuBarSymbol && titleText == lastMenuBarTitle { return }
+        lastMenuBarSymbol = symbol
+        lastMenuBarTitle = titleText
+
+        button.image = NSImage(systemSymbolName: symbol,
+                               accessibilityDescription: "GenesisFanControl")
+        button.image?.isTemplate = true
+        button.imagePosition = .imageLeading
+
         // Use NSAttributedString with explicit labelColor so the title
         // adapts to menu-bar appearance — plain `button.title` falls
         // back to black on the system's default font, which becomes
@@ -339,11 +355,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // "38 °C · 43 °C" black on dark). labelColor resolves to the
         // correct contrasting color at draw time, and we vertically-
         // center it to the icon's baseline via NSFont.menuBarFont.
-        if parts.isEmpty {
+        if titleText.isEmpty {
             button.title = ""
             button.attributedTitle = NSAttributedString(string: "")
         } else {
-            let titleText = " " + parts.joined(separator: " · ")
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.menuBarFont(ofSize: 0),
                 .foregroundColor: NSColor.labelColor,

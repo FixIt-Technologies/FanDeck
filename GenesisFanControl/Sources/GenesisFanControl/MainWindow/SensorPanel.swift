@@ -192,6 +192,7 @@ private struct SensorGroupView: View {
                     SensorRow(sensor: s,
                               useFahrenheit: useFahrenheit,
                               precise: precise)
+                        .equatable()
                 }
             }
         }
@@ -210,7 +211,11 @@ private struct SensorGroupView: View {
     }
 }
 
-private struct SensorRow: View {
+// Equatable so SwiftUI skips re-rendering a row whose (sensor, unit,
+// precision) is byte-identical — when one sensor crosses a 0.1 °C bucket
+// and forces a panel re-eval, the other ~39 unchanged rows are pruned.
+// All stored properties are Equatable, so `==` is auto-synthesized.
+private struct SensorRow: View, Equatable {
     let sensor: TempSensor
     let useFahrenheit: Bool
     let precise: Bool
@@ -255,7 +260,13 @@ private struct SensorRow: View {
                     .fill(colorForTemp(sensor.celsius).opacity(0.35))
                     .frame(width: max(1, geo.size.width * fractionOfHundred),
                            height: 2)
-                    .animation(.easeOut(duration: 0.6), value: sensor.celsius)
+                    // No implicit animation. Sensor temps jitter every 1 Hz
+                    // tick (≥0.1 °C diode noise / mock sine drift), so an
+                    // `.animation(value: sensor.celsius)` here kicked a 0.6 s
+                    // width ease on ALL ~40 rows EVERY tick — a sustained
+                    // per-frame render loop (Focus C co-primary). The bar
+                    // still snaps to the correct width each tick; a 2 px
+                    // capsule step is imperceptible without the ease.
             }
         }
         .frame(height: 2)

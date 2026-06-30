@@ -101,34 +101,56 @@ public final class AppState: ObservableObject {
         }
         let smc = self.smc
         let helperClient = self.helperClient
+        // Throttle the helper liveness check to once every 5 s instead of
+        // every tick. health() is a full socket round-trip (connect + write
+        // + read + close + JSON-decode) — ~0.1% CPU but a steady stream of
+        // syscalls + context switches for a value that changes only on
+        // install/uninstall. `nil` means "skipped — leave health as-is".
+        // (Banner liveness updating every 5 s rather than 1 s is
+        // imperceptible.) tick() is @MainActor so `lastHealthCheck` is
+        // race-free.
+        let now = Date()
+        let needHealth = now.timeIntervalSince(lastHealthCheck) >= 5
         smcQueue.async { [weak self] in
             smc.refresh()
             let snap = smc.snapshot()
-            let health = helperClient.health()
+            let health = needHealth ? helperClient.health() : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.publish(snapshot: snap)
-                self.helperHealth = health
-                switch health {
-                case .healthy:
-                    self.helperAvailable = true
-                    // Only auto-clear the banner if the user hasn't been
-                    // told they need to act. installHelperError stays
-                    // around so the user sees the result of their last
-                    // attempt.
-                    self.needsElevation = false
-                case .outdated:
-                    self.helperAvailable = true
-                    self.needsElevation = true
-                case .down:
-                    self.helperAvailable = false
-                    // Don't auto-flip needsElevation on .down alone — a
-                    // brand-new launch with no helper installed should
-                    // wait for the first failed write to surface the
-                    // banner, otherwise users see it before they've
-                    // tried to do anything.
+                if let health {
+                    self.lastHealthCheck = now
+                    self.applyHealth(health)
                 }
             }
+        }
+    }
+
+    /// When we last completed a helper liveness round-trip. Gates `tick()`'s
+    /// `health()` call down to ~1/5 s (see `tick`).
+    private var lastHealthCheck: Date = .distantPast
+
+    /// Apply a fresh helper health reading, assigning each `@Published` only
+    /// when it actually changes so an unchanged reading fires no
+    /// objectWillChange (and thus no view invalidation).
+    private func applyHealth(_ health: HelperClient.Health) {
+        if helperHealth != health { helperHealth = health }
+        switch health {
+        case .healthy:
+            if !helperAvailable { helperAvailable = true }
+            // Only auto-clear the banner if the user hasn't been told they
+            // need to act. installHelperError stays around so the user sees
+            // the result of their last attempt.
+            if needsElevation { needsElevation = false }
+        case .outdated:
+            if !helperAvailable { helperAvailable = true }
+            if !needsElevation { needsElevation = true }
+        case .down:
+            if helperAvailable { helperAvailable = false }
+            // Don't auto-flip needsElevation on .down alone — a brand-new
+            // launch with no helper installed should wait for the first
+            // failed write to surface the banner, otherwise users see it
+            // before they've tried to do anything.
         }
     }
 
@@ -145,9 +167,73 @@ public final class AppState: ObservableObject {
             merged[i].mode = intent.mode
             if let t = intent.targetRPM { merged[i].targetRPM = t }
         }
-        self.fans = merged
-        self.sensors = snap.sensors
-        self.lastUpdated = Date()
+        // Change-driven publish. `@Published`'s `willSet` calls
+        // objectWillChange.send() on EVERY assignment — even an identical
+        // array — which re-invokes every observing view's body. Reassigning
+        // fans + sensors + lastUpdated unconditionally every second forced a
+        // full MainView + SensorPanel re-render on a perfectly idle machine
+        // (Focus B's biggest backend lever). Only assign what actually moved.
+        //
+        // Both signals are deadbanded against the last PUBLISHED value, not
+        // raw-`==`'d: the real backend jitters fan currentRPM by ±6–20 RPM
+        // and every temp diode by ≥0.1 °C every single tick, so an exact
+        // compare (or a rounding-bucket quantize, which flickers at the
+        // bucket edge across ~30 diodes) would republish nearly every tick
+        // and defeat the whole point. A deadband from the published value
+        // filters sub-perceptual noise entirely and only fires on genuine
+        // drift — taking idle backend-driven invalidations to ~0/sec, which
+        // also starves the per-tick gauge-fill ease (displayedFraction stops
+        // changing) and the 40-row panel re-render.
+        var fanChanged = false
+        var sensorChanged = false
+        if !Self.fansApproxEqual(fans, merged) {
+            fans = merged
+            fanChanged = true
+        }
+        if !Self.sensorsApproxEqual(sensors, snap.sensors) {
+            sensors = snap.sensors
+            sensorChanged = true
+        }
+        // lastUpdated changes every tick by construction, so it must be gated
+        // too or it re-fires objectWillChange on its own and defeats the
+        // dedupe. Now it advances on genuine change → "time since last change".
+        if fanChanged || sensorChanged { lastUpdated = Date() }
+    }
+
+    /// Tolerant fan compare. Control-relevant fields (mode, targetRPM,
+    /// envelope, identity) compare EXACTLY so any real change republishes
+    /// instantly; only the noisy `currentRPM` live readout is deadbanded.
+    /// `tol` = max(25 RPM, 1% of the fan envelope) — below human perception
+    /// on the gauge, and below the ±6–20 RPM idle jitter measured on real
+    /// hardware (which refuted Focus B's "Int RPMs are stable at idle"
+    /// assumption). Compared against the last published value, so noise never
+    /// accumulates a republish — only genuine drift past `tol` does.
+    nonisolated static func fansApproxEqual(_ a: [Fan], _ b: [Fan]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (x, y) in zip(a, b) {
+            if x.id != y.id || x.name != y.name { return false }
+            if x.minRPM != y.minRPM || x.maxRPM != y.maxRPM { return false }
+            if x.mode != y.mode || x.targetRPM != y.targetRPM { return false }
+            let tol = max(25, (y.maxRPM - y.minRPM) / 100)
+            if abs(x.currentRPM - y.currentRPM) >= tol { return false }
+        }
+        return true
+    }
+
+    /// Tolerant sensor compare — 0.5 °C deadband per sensor, measured from
+    /// the last published reading. IDs/order/count must match exactly. A
+    /// deadband (not a rounding bucket) is essential: ~30 diodes each carry
+    /// ≥0.1 °C noise, so bucket-edge straddling would flip several sensors
+    /// every tick and republish anyway; a deadband filters that flicker and
+    /// fires only on genuine ≥0.5 °C drift. Tradeoff: precise-mode (0.1 °C)
+    /// readouts update in coarser time steps — imperceptible on a fan monitor.
+    nonisolated static func sensorsApproxEqual(_ a: [TempSensor], _ b: [TempSensor]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (x, y) in zip(a, b) {
+            if x.id != y.id { return false }
+            if abs(x.celsius - y.celsius) >= 0.5 { return false }
+        }
+        return true
     }
 
     /// Per-fan intent captured by `applyOptimisticMode` and cleared once
