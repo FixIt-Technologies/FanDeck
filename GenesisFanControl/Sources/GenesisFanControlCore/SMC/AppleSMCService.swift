@@ -865,14 +865,17 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         }
 
         // Bucket Tp* and Tg* prefixes separately. Any 0.01 °C bucket
-        // with ≥4 members is a power-gated ghost cluster.
+        // with ≥3 members is a power-gated ghost cluster — lowered from
+        // ≥4 because the M4 ghost stamp can affect just 3 cores at a
+        // time as clusters wake asymmetrically (screenshot #33 had
+        // exactly 3 perf cores stuck at 40.00 °C).
         func clusterGhosts<S: Sequence>(_ readings: S) -> Set<String>
         where S.Element == RawReading {
             let arr = Array(readings)
-            guard arr.count >= 4 else { return [] }
+            guard arr.count >= 3 else { return [] }
             let buckets = Dictionary(grouping: arr, by: { Int($0.c * 100) })
             var out: Set<String> = []
-            for (_, members) in buckets where members.count >= 4 {
+            for (_, members) in buckets where members.count >= 3 {
                 out.formUnion(members.map(\.key))
             }
             return out
@@ -884,6 +887,20 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             Log.smc.warning("Ghost cluster filter suppressed \(ghostKeys.count) sensors: \(ghostKeys.sorted().joined(separator: ",")) — power-gated cache stamp")
         }
 
+        // Known firmware sentinel values for Tp*/Tg* per-core sensors.
+        // These EXACT two-decimal values are deterministic cache stamps,
+        // not real diode readings. Real per-core temps have thermal
+        // noise of ≥0.05 °C, so a reading that lands EXACTLY on one of
+        // these to the hundredth is a ghost regardless of cluster size
+        // — catches the case where only 1 or 2 cores ghost while
+        // others are awake (cluster detector below requires ≥3).
+        let knownSentinels: Set<Int> = [
+            -400,   // -4.00 °C — observed on Tp0d
+               0,   //  0.00 °C — observed on Eff cores
+             190,   //  1.90 °C — Float32 0x3FF33333, most common
+            4000,   // 40.00 °C — M4 "idle floor" cache stamp
+        ]
+
         // Pass 2: emit sensors in original sensorKeys order.
         for (key, name, kind) in sensorKeys {
             // Read failure or out-of-band: hold last valid (or omit).
@@ -894,7 +911,11 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
                 continue
             }
             let isCoreCpu = key.hasPrefix("Tp") || key.hasPrefix("Tg")
-            let isGhost = ghostKeys.contains(key) || (isCoreCpu && v < 10)
+            let bucket = Int(v * 100)
+            let isKnownSentinel = isCoreCpu && knownSentinels.contains(bucket)
+            let isGhost = ghostKeys.contains(key)
+                       || isKnownSentinel
+                       || (isCoreCpu && v < 10)
             if isGhost {
                 if let prev = lastValidSensor[key] {
                     newSensors.append(prev)
