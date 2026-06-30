@@ -337,45 +337,70 @@ private struct GearButton: View {
     private func openSettingsRobustly() {
         Log.ui.warning("GearButton tapped — entering openSettingsRobustly()")
 
-        // The Settings scene won't render unless the app is .regular
-        // activation policy at the moment of dispatch. .accessory apps
-        // can have the scene REGISTERED but the window-server refuses
-        // to materialise its window. Promote unconditionally; the
-        // existing AppDelegate.applyActivationPolicy() restores the
-        // user's preference when the main window closes.
-        let prevPolicy = NSApp.activationPolicy()
-        if prevPolicy != .regular {
+        // The Settings scene won't COME FORWARD unless the app is .regular
+        // and active. .accessory apps can dispatch showSettingsWindow:
+        // successfully (the selector returns true) yet the window-server
+        // never brings the window to front — which is exactly the bug:
+        // the log said "opened via showSettingsWindow:" but nothing
+        // appeared. Promote, activate, dispatch, THEN explicitly hunt the
+        // Settings window and raise it (it's created asynchronously, so we
+        // poll for it on the next few run-loop turns).
+        if NSApp.activationPolicy() != .regular {
             NSApp.setActivationPolicy(.regular)
-            Log.ui.debug("Settings: promoted \(prevPolicy.rawValue) → .regular for scene visibility")
         }
         NSApp.activate(ignoringOtherApps: true)
 
-        // 1) Modern selector (macOS 13+).
-        if NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-            Log.ui.warning("Settings opened via showSettingsWindow:")
-            return
-        }
-        // 2) Legacy selector (macOS ≤ 12 / fallback name).
-        if NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil) {
-            Log.ui.warning("Settings opened via showPreferencesWindow:")
-            return
-        }
-        // 3) Walk the main Application menu for an item whose title looks
-        //    like Settings / Preferences and invoke its action explicitly.
-        if let mainMenu = NSApp.mainMenu {
-            for menuItem in mainMenu.items {
-                guard let submenu = menuItem.submenu else { continue }
-                for sub in submenu.items where
-                    sub.title.localizedCaseInsensitiveContains("settings") ||
-                    sub.title.localizedCaseInsensitiveContains("preferences") {
-                    if let action = sub.action {
-                        let ok = NSApp.sendAction(action, to: sub.target, from: nil)
-                        Log.ui.warning("Settings opened via menu walk '\(sub.title)' → \(ok)")
-                        if ok { return }
-                    }
+        let dispatched =
+            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) ||
+            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil) ||
+            openSettingsViaMenu()
+        Log.ui.warning("Settings dispatch result=\(dispatched) — now raising the window")
+
+        // The SwiftUI Settings window materialises a beat after the action
+        // fires. Poll up to ~1s for it and force it key+front+centered.
+        raiseSettingsWindow(attempt: 0)
+    }
+
+    private func openSettingsViaMenu() -> Bool {
+        guard let mainMenu = NSApp.mainMenu else { return false }
+        for menuItem in mainMenu.items {
+            guard let submenu = menuItem.submenu else { continue }
+            for sub in submenu.items where
+                sub.title.localizedCaseInsensitiveContains("settings") ||
+                sub.title.localizedCaseInsensitiveContains("preferences") {
+                if let action = sub.action,
+                   NSApp.sendAction(action, to: sub.target, from: nil) {
+                    return true
                 }
             }
         }
-        Log.ui.error("Settings: all selector + menu-walk fallbacks failed (policy=\(NSApp.activationPolicy().rawValue))")
+        return false
+    }
+
+    /// Find the SwiftUI Settings window and force it to the front. SwiftUI
+    /// names it "com_apple_SwiftUI_Settings_window"; we also match by title
+    /// as a fallback. Retries a few times because the window is created
+    /// asynchronously after showSettingsWindow: dispatches.
+    private func raiseSettingsWindow(attempt: Int) {
+        let win = NSApp.windows.first { w in
+            (w.identifier?.rawValue.contains("Settings") ?? false) ||
+            w.title.localizedCaseInsensitiveContains("settings") ||
+            w.title.localizedCaseInsensitiveContains("preferences")
+        }
+        if let win {
+            NSApp.activate(ignoringOtherApps: true)
+            win.center()
+            win.makeKeyAndOrderFront(nil)
+            win.orderFrontRegardless()
+            Log.ui.warning("Settings window raised: '\(win.title)' id=\(win.identifier?.rawValue ?? "—")")
+            return
+        }
+        guard attempt < 10 else {
+            Log.ui.error("Settings window never appeared after dispatch (policy=\(NSApp.activationPolicy().rawValue))")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            raiseSettingsWindow(attempt: attempt + 1)
+        }
     }
 }

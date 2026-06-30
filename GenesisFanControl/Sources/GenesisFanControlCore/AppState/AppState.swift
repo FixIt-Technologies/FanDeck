@@ -167,37 +167,24 @@ public final class AppState: ObservableObject {
             merged[i].mode = intent.mode
             if let t = intent.targetRPM { merged[i].targetRPM = t }
         }
-        // Change-driven publish. `@Published`'s `willSet` calls
-        // objectWillChange.send() on EVERY assignment — even an identical
-        // array — which re-invokes every observing view's body. Reassigning
-        // fans + sensors + lastUpdated unconditionally every second forced a
-        // full MainView + SensorPanel re-render on a perfectly idle machine
-        // (Focus B's biggest backend lever). Only assign what actually moved.
-        //
-        // Both signals are deadbanded against the last PUBLISHED value, not
-        // raw-`==`'d: the real backend jitters fan currentRPM by ±6–20 RPM
-        // and every temp diode by ≥0.1 °C every single tick, so an exact
-        // compare (or a rounding-bucket quantize, which flickers at the
-        // bucket edge across ~30 diodes) would republish nearly every tick
-        // and defeat the whole point. A deadband from the published value
-        // filters sub-perceptual noise entirely and only fires on genuine
-        // drift — taking idle backend-driven invalidations to ~0/sec, which
-        // also starves the per-tick gauge-fill ease (displayedFraction stops
-        // changing) and the 40-row panel re-render.
-        var fanChanged = false
-        var sensorChanged = false
+        // SENSORS publish EVERY tick. This is a live temperature monitor —
+        // its entire job is showing the current reading each second, so the
+        // sensor array + the "Xs ago" timestamp must always advance. (A
+        // 0.5 °C deadband here made the panel look frozen for many seconds
+        // at idle and made "just now" lie — user-reported.) The cost is
+        // bounded by SensorRow being Equatable (`.equatable()`), so only the
+        // rows whose value actually moved re-render their body.
+        sensors = snap.sensors
+        lastUpdated = Date()
+
+        // FANS stay deadbanded. The gauge is a control surface, not a live
+        // graph: ±6–20 RPM of idle tach jitter shouldn't re-trigger the
+        // fill's ease animation every tick. Republish only on a genuine
+        // change (mode/target/envelope exact, currentRPM past a small
+        // tolerance) so the gauge rests between real movements.
         if !Self.fansApproxEqual(fans, merged) {
             fans = merged
-            fanChanged = true
         }
-        if !Self.sensorsApproxEqual(sensors, snap.sensors) {
-            sensors = snap.sensors
-            sensorChanged = true
-        }
-        // lastUpdated changes every tick by construction, so it must be gated
-        // too or it re-fires objectWillChange on its own and defeats the
-        // dedupe. Now it advances on genuine change → "time since last change".
-        if fanChanged || sensorChanged { lastUpdated = Date() }
     }
 
     /// Tolerant fan compare. Control-relevant fields (mode, targetRPM,
