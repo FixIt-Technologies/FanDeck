@@ -204,9 +204,20 @@ final class FansCLI {
             FileHandle.standardError.write(Data("Unknown mode: \(kind) (use auto|const|sensor|ramp)\n".utf8))
             return 64
         }
-        state.setMode(mode, for: fanID)
-        print("OK — \(fanID) → \(mode.displayName)")
-        return 0
+        // Call the SMC service SYNCHRONOUSLY. state.setMode() dispatches
+        // onto AppState's smcQueue and returns immediately — but the CLI
+        // process exits right after, so that async write would never run
+        // (every `fans set` printed a fake "OK" and did nothing). Go
+        // straight to smc.setMode, which is synchronous and returns the
+        // real result (routing through the helper internally).
+        let ok = state.smc.setMode(mode, for: fanID)
+        if ok {
+            print("OK — \(fanID) → \(mode.displayName)")
+            return 0
+        } else {
+            FileHandle.standardError.write(Data("FAILED — \(fanID) → \(mode.displayName) (helper unreachable? run the GUI's Install/Update Helper)\n".utf8))
+            return 1
+        }
     }
 
     private func cmdWatch(args: [String]) -> Int32 {

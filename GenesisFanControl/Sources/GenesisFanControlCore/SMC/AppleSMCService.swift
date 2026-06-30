@@ -225,74 +225,99 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             return false
         }
         // Per-call request ID so a single user click can be traced from
-        // here through autoReleaseDirect / unlockFanControl / writeRPM,
-        // into the helper if we fall back, and out to the cached-mode
-        // update. Search the unified log / in-app log panel for r=NNN
-        // to follow one click end-to-end.
+        // here into the helper (or the direct path) and out to the
+        // cached-mode update. Search the log for r=NNN to follow one
+        // click end-to-end.
         let r = nextRequestID()
         Log.fans.info("setMode r=\(r) fan=\(fanID) idx=\(idx) mode=\(modeDescription(mode)) hasHelper=\(helperClient != nil)")
+
+        // HELPER-FIRST. On the unprivileged GUI/CLI the kernel rejects
+        // EVERY direct SMC write (kIOReturnNotPrivileged — observe the
+        // endless "writeRPM IOConnect returned nil" in the logs), so the
+        // root helper is the ONLY process that can actually move a fan.
+        // Route through it and trust its result. The direct path below
+        // only runs when we ARE the helper (helperClient == nil) or when
+        // no helper is installed and the helper call fails — in which
+        // case a direct attempt is the last resort (and will succeed if
+        // this process happens to be privileged, e.g. an Intel Mac or
+        // root CLI).
+        if let helper = helperClient {
+            if setModeViaHelper(mode, for: fanID, idx: idx, helper: helper, r: r) {
+                return true
+            }
+            Log.fans.warning("setMode r=\(r) fan=\(fanID) helper path failed — last-resort direct attempt")
+        }
+
+        return setModeDirect(mode, for: fanID, idx: idx, r: r)
+    }
+
+    /// Route a mode change through the privileged helper and update the
+    /// local cache on success. Returns false if the helper is
+    /// unreachable or rejects the write (caller then tries direct).
+    private func setModeViaHelper(_ mode: FanMode, for fanID: String,
+                                  idx: Int, helper: HelperClient, r: UInt32) -> Bool {
         switch mode {
         case .auto:
-            // Apple-Silicon-correct release: F0Md MUST be set back to 0
-            // BEFORE Ftst is dropped. The firmware re-locks the moment
-            // Ftst goes 1→0, and any subsequent F0Md write while the
-            // lock is back silently fails — leaving the fan stuck in
-            // CONSTANT despite us thinking we released. Symptom: user
-            // clicks "Auto", UI optimistically flips to auto, helper
-            // returns false, AppState reverts UI to the previous
-            // constant ("blink and back to old setting").
+            guard helper.setMode(.auto, for: fanID) else { return false }
+            Log.fans.info("setMode r=\(r) fan=\(fanID) AUTO OK (helper)")
+            updateCachedMode(for: fanID, to: .auto)
+            lastReleaseAt[idx] = Date()   // settle-window guard in primeSnapshot
+            return true
+        case .constant(let rpm):
+            guard helper.setMode(.constant(rpm: rpm), for: fanID) else { return false }
+            Log.fans.info("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) OK (helper)")
+            updateCachedMode(for: fanID, to: .constant(rpm: rpm), targetRPM: rpm)
+            return true
+        case .sensorBased:
+            // Sensor-based is host-driven: the GUI computes a target each
+            // tick and the per-tick re-assertion sends it to the helper.
+            // To get the fan into constant/unlocked NOW, seed the helper
+            // with the current target (or a safe floor).
+            let seed = cachedFans.first(where: { $0.id == fanID })?.targetRPM ?? minSafeRPM(forFan: idx)
+            guard helper.setMode(.constant(rpm: seed), for: fanID) else { return false }
+            Log.fans.info("setMode r=\(r) fan=\(fanID) SENSOR OK (helper, seeded \(seed))")
+            updateCachedMode(for: fanID, to: mode)
+            return true
+        }
+    }
+
+    /// Direct SMC write path — used inside the helper process (root) or
+    /// as a last resort when no helper is available. On the unprivileged
+    /// GUI these writes fail and the method returns false.
+    @discardableResult
+    private func setModeDirect(_ mode: FanMode, for fanID: String, idx: Int, r: UInt32) -> Bool {
+        switch mode {
+        case .auto:
+            // Apple-Silicon-correct release: F0Md → 0 first, then Ftst → 0
+            // only if this is the last non-auto fan (handled inside
+            // autoReleaseDirect). On a privileged process these writes
+            // land; on the unprivileged GUI they fail and we return false
+            // (the helper path in setMode() already ran first).
             if autoReleaseDirect(fanIdx: idx, r: r) {
                 Log.fans.info("setMode r=\(r) fan=\(fanID) AUTO OK (direct)")
                 updateCachedMode(for: fanID, to: .auto)
                 return true
             }
-            Log.fans.warning("setMode r=\(r) fan=\(fanID) AUTO direct failed — trying helper")
-            if let helper = helperClient, helper.setMode(.auto, for: fanID) {
-                Log.fans.info("setMode r=\(r) fan=\(fanID) AUTO OK (via helper)")
-                updateCachedMode(for: fanID, to: .auto)
-                return true
-            }
-            Log.fans.error("setMode r=\(r) fan=\(fanID) AUTO FAILED — direct + helper both rejected")
+            Log.fans.error("setMode r=\(r) fan=\(fanID) AUTO FAILED (direct path, no privilege)")
             return false
         case .constant(let rpm):
-            let unlocked = unlockFanControl(fanIdx: idx, r: r)
-            Log.fans.debug("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) unlock=\(unlocked)")
-            if unlocked && writeRPM(fanIdx: idx, rpm: rpm, r: r) {
+            if unlockFanControl(fanIdx: idx, r: r) && writeRPM(fanIdx: idx, rpm: rpm, r: r) {
                 Log.fans.info("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) OK (direct)")
                 updateCachedMode(for: fanID, to: .constant(rpm: rpm), targetRPM: rpm)
                 return true
             }
-            Log.fans.warning("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) direct failed — trying helper")
-            if let helper = helperClient, helper.setMode(.constant(rpm: rpm), for: fanID) {
-                Log.fans.info("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) OK (via helper)")
-                updateCachedMode(for: fanID, to: .constant(rpm: rpm), targetRPM: rpm)
-                return true
-            }
-            Log.fans.error("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) FAILED — direct + helper both rejected")
+            Log.fans.error("setMode r=\(r) fan=\(fanID) CONSTANT \(rpm) FAILED (direct path, no privilege)")
             return false
         case .sensorBased:
-            // Sensor-based is host-driven (we compute the target RPM from
-            // the chosen sensor each poll tick), but the SMC itself still
-            // needs to be in CONSTANT (F0Md=1, Ftst unlocked) so the per-
-            // tick writeRPM in primeSnapshot() actually moves the fan.
-            // Without this, F0Md stayed at 0 (auto) and the firmware
-            // ignored every F0Tg write — fan sat at its idle floor.
+            // Sensor-based is host-driven (target computed per tick), but
+            // the SMC still needs to be unlocked into CONSTANT so the
+            // per-tick writeRPM actually moves the fan.
             if unlockFanControl(fanIdx: idx, r: r) {
                 updateCachedMode(for: fanID, to: mode)
-                Log.fans.info("setMode r=\(r) fan=\(fanID) SENSOR OK (host-driven, unlocked direct)")
+                Log.fans.info("setMode r=\(r) fan=\(fanID) SENSOR OK (direct unlock)")
                 return true
             }
-            Log.fans.warning("setMode r=\(r) fan=\(fanID) SENSOR unlock failed direct — trying helper")
-            if let helper = helperClient,
-               helper.setMode(.constant(rpm: cachedFans.first(where: { $0.id == fanID })?.targetRPM ?? minSafeRPM(forFan: idx)),
-                              for: fanID) {
-                // Helper successfully put us in constant. Switch cached
-                // mode to sensorBased (host loop will drive target).
-                updateCachedMode(for: fanID, to: mode)
-                Log.fans.info("setMode r=\(r) fan=\(fanID) SENSOR OK (host-driven, via helper)")
-                return true
-            }
-            Log.fans.error("setMode r=\(r) fan=\(fanID) SENSOR FAILED — direct + helper both rejected unlock")
+            Log.fans.error("setMode r=\(r) fan=\(fanID) SENSOR FAILED (direct path, no privilege)")
             return false
         }
     }
@@ -343,13 +368,20 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         let initFtst = readDouble("Ftst") ?? -1
         Log.fans.debug("autoReleaseDirect r=\(r) fan=F\(fanIdx) key=\(mKey) — initial md=\(initMd) ftst=\(initFtst)")
 
-        // 1. Hygiene write: mode → 0. No readback — on Apple Silicon
-        //    this value is transient; it will settle to 3 once Ftst
-        //    drops and thermalmonitord reclaims. Failure is logged
-        //    but non-fatal; the Ftst=0 below is what actually matters.
+        // 1. Hygiene write: mode → 0. This is the LOAD-BEARING write
+        //    when other fans are still constant (we keep Ftst=1).
+        //    If it FAILS — which is the normal case from the
+        //    unprivileged GUI — we must return false so the caller
+        //    falls through to the helper, which has root and can
+        //    actually write F0Md. Previously we returned true
+        //    unconditionally and setMode silently skipped the helper
+        //    fallback, leaving F0Md=1 in SMC; next primeSnapshot read
+        //    md=1, the UI reverted .auto → .constant, and the AUTO
+        //    button appeared to do nothing. (User logs r=4,r=6,r=7,
+        //    r=8,r=9 all hit this path at 03:26.)
         let modeWrote = writeUInt8(key: mKey, value: 0)
         if !modeWrote {
-            Log.fans.debug("autoReleaseDirect r=\(r) fan=F\(fanIdx) \(mKey)=0 write rejected — continuing anyway (Ftst=0 is the load-bearing op)")
+            Log.fans.debug("autoReleaseDirect r=\(r) fan=F\(fanIdx) \(mKey)=0 write rejected (likely unprivileged) — will fall through to helper")
         }
 
         // 2. Ftst gate: only drop the global lock when no other fan is
@@ -364,8 +396,13 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             }
         }
         if othersStillConstant {
-            Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) keeping Ftst=1 — other fans still non-auto; this fan will read md=1 until siblings release")
-            return true
+            if modeWrote {
+                Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) \(mKey)=0 ok; keeping Ftst=1 (other fans still non-auto)")
+                lastReleaseAt[fanIdx] = Date()
+                return true
+            }
+            // Direct mode-write rejected — let caller route through helper.
+            return false
         }
 
         // 3. Last non-auto fan going home — release the global veto.
@@ -375,11 +412,11 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         //    flip F{i}Md from 1 to 3, and primeSnapshot's md==1
         //    classifier maps 3 → .auto so the UI won't flicker.
         let ftstOk = writeUInt8(key: "Ftst", value: 0)
-        Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) Ftst=0 wrote=\(ftstOk) (last non-auto fan home; expecting md=3 within ~4s)")
-        // Stamp the release time so primeSnapshot can guard against
-        // the in-between window where md transitions 1 → 3 and any
-        // observer reading the SMC straight after our write might still
-        // see md=1. See lastReleaseAt usage in primeSnapshot.
+        Log.fans.info("autoReleaseDirect r=\(r) fan=F\(fanIdx) modeWrote=\(modeWrote) Ftst=0 wrote=\(ftstOk) (last non-auto fan home; expecting md=3 within ~4s)")
+        if !modeWrote || !ftstOk {
+            // Either critical write failed — fall through to helper.
+            return false
+        }
         lastReleaseAt[fanIdx] = Date()
         return true
     }
@@ -937,55 +974,29 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
         cachedFans = newFans
         cachedSensors = newSensors
 
-        // Host-side per-tick fan-control re-assertion. Two cases:
-        //  • .sensorBased: compute the curve value from the chosen sensor.
-        //  • .constant: re-push the user's setpoint. Apple Silicon's
-        //    thermalmonitord otherwise claws F0Tg back to whatever it
-        //    thinks the current load needs, so the physical fan drifts
-        //    away from what the user pinned.
+        // Per-tick fan driving. Re-assertion of CONSTANT is now OWNED BY
+        // THE HELPER (it holds heldTargets and re-pushes every second as
+        // root). So the GUI does NOTHING here for .constant — set-once via
+        // setMode is enough; the helper keeps it pinned. This removes the
+        // 1 Hz socket spam + the Ftst-bounce that fought AUTO.
         //
-        // Routing: try a direct writeRPM first (fast, no IPC, succeeds
-        // when this process happens to have SMC write privileges); on
-        // failure route through helper.setTarget (one cheap socket call
-        // — the helper runs as root so the SMC write actually lands).
-        // The GUI is non-root, so on Apple Silicon the helper path is
-        // typically the one that actually moves the fan.
+        // .sensorBased stays host-driven: only the GUI knows the chosen
+        // sensor + curve, so we compute the target each tick and send it
+        // to the helper (which holds + re-asserts it between our updates).
+        // Inside the helper process (helperClient == nil) the helper's own
+        // re-assertion timer drives it, so we skip here.
+        guard helperClient != nil else { return }   // helper drives itself
         for fan in cachedFans {
-            guard let fanIdx = Int(fan.id.dropFirst()) else { continue }
-            let target: Int?
-            switch fan.mode {
-            case .sensorBased(let sid, let pts):
-                if let s = newSensors.first(where: { $0.id == sid }) {
-                    target = rpmForTemp(s.celsius, fan: fan, points: pts)
-                } else {
-                    // Sensor disappeared (USB temp probe unplugged, virtual
-                    // aggregate degenerated because all cores dropped out,
-                    // etc.). Leaving the fan in CONSTANT-unlocked at a
-                    // stale targetRPM is genuinely dangerous — the chip
-                    // is no longer being controlled by anything observing
-                    // temperature. Drop it back to AUTO and update the
-                    // cached mode so the UI reflects reality.
-                    Log.fans.warning("Fan \(fan.id) sensor '\(sid)' missing from snapshot — falling back to AUTO")
-                    _ = setMode(.auto, for: fan.id)
-                    target = nil
-                }
-            case .constant(let rpm):
-                target = rpm
-            case .auto:
-                target = nil
-            }
-            guard let rpm = target else { continue }
-            // No dedupe by "target unchanged" — we MUST push every tick
-            // even when our intent is identical, because the firmware's
-            // claw-back changes the SMC's view (F0Tg/F0Ac) without
-            // changing ours. Re-pushing is what keeps the physical fan
-            // pinned. helperClient.setMode(.constant(...)) wraps a single
-            // socket round-trip + unlock-already-succeeded fast path; the
-            // cost is in the order of a millisecond per fan per tick.
-            let direct = writeRPM(fanIdx: fanIdx, rpm: rpm)
-            if !direct {
-                let helperOk = helperClient?.setMode(.constant(rpm: rpm), for: fan.id) ?? false
-                Log.fans.debug("primeSnapshot reassert fan=\(fan.id) target=\(rpm) direct=false helper=\(helperOk)")
+            guard case .sensorBased(let sid, let pts) = fan.mode else { continue }
+            if let s = newSensors.first(where: { $0.id == sid }) {
+                let rpm = rpmForTemp(s.celsius, fan: fan, points: pts)
+                _ = helperClient?.setMode(.constant(rpm: rpm), for: fan.id)
+            } else {
+                // Sensor disappeared — leaving the fan unlocked at a stale
+                // target with nothing observing temperature is dangerous.
+                // Drop to AUTO.
+                Log.fans.warning("Fan \(fan.id) sensor '\(sid)' missing — falling back to AUTO")
+                _ = setMode(.auto, for: fan.id)
             }
         }
     }

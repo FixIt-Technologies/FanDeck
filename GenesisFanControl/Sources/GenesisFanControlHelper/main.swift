@@ -55,46 +55,67 @@ do {
 }
 log("listening on \(HelperConstants.socketPath) (root:admin 0660)")
 
-// MARK: - Locked-fan tracking + revert
+// MARK: - Held-fan state + re-assertion (helper OWNS the hold)
 
-/// Fans this helper has put into non-auto mode this session. Used by:
-///   • SIGTERM/SIGINT — revert each one to .auto before exit so a kill
-///     can't strand a fan at high RPM.
-///   • Idle watchdog — if no client has talked to us in 60s and we're
-///     holding locks, revert them.
+/// Fans this helper is actively holding at a constant RPM, fanID → rpm.
+/// The helper RE-ASSERTS these on its own 1 Hz timer (it's root and
+/// persistent), so a pinned fan holds regardless of whether the GUI is
+/// running. This is the core of the design: the unprivileged GUI cannot
+/// write SMC and cannot reliably re-assert; the root helper can and does.
+///   • setConstant adds/updates an entry + writes once immediately.
+///   • setAuto removes the entry + releases the fan.
+///   • the re-assertion timer re-pushes every held target each second to
+///     defeat thermalmonitord's claw-back.
+///   • SIGTERM/SIGINT + idle watchdog revert every held fan (safety).
 ///
-/// SwiftAtomics not in std, so use a global serial queue to gate every
-/// touch. Helper is otherwise single-threaded (accept loop), but the
-/// watchdog timer fires on its own dispatch queue.
+/// All touches gated by stateQueue (the accept loop, the re-assertion
+/// timer, and the watchdog all run on different queues).
 let stateQueue = DispatchQueue(label: "dev.foltyn.gfc.helper.state")
-nonisolated(unsafe) var lockedFans: Set<String> = []
+nonisolated(unsafe) var heldTargets: [String: Int] = [:]
 nonisolated(unsafe) var lastActivity: Date = Date()
 
 @Sendable func recordActivity() {
     stateQueue.sync { lastActivity = Date() }
 }
 
-@Sendable func markLocked(_ fanID: String) {
-    _ = stateQueue.sync { lockedFans.insert(fanID) }
+@Sendable func hold(_ fanID: String, rpm: Int) {
+    stateQueue.sync { heldTargets[fanID] = rpm }
 }
 
-@Sendable func markUnlocked(_ fanID: String) {
-    _ = stateQueue.sync { lockedFans.remove(fanID) }
+@Sendable func release(_ fanID: String) {
+    _ = stateQueue.sync { heldTargets.removeValue(forKey: fanID) }
 }
 
-/// Revert every fan in `lockedFans` to auto. Best-effort — failures are
-/// logged. Called from the SIGTERM handler (signal-safe enough — we're
-/// already on our way out) and the idle watchdog.
-func revertAllLockedFans(reason: String) {
-    let snap = stateQueue.sync { lockedFans }
+/// Revert every held fan to auto. Best-effort. Called from the SIGTERM
+/// handler and the idle watchdog (GUI-crash safety net).
+func revertAllHeldFans(reason: String) {
+    let snap = stateQueue.sync { heldTargets }
     guard !snap.isEmpty else { return }
-    log("revertAllLockedFans: \(reason) — reverting \(snap.sorted())")
-    for fanID in snap {
+    log("revertAllHeldFans: \(reason) — reverting \(snap.keys.sorted())")
+    for fanID in snap.keys {
         let ok = smc.setMode(.auto, for: fanID)
         log("  revert \(fanID) -> \(ok ? "AUTO" : "FAILED")")
-        if ok { markUnlocked(fanID) }
+        if ok { release(fanID) }
     }
 }
+
+// MARK: - Re-assertion timer (defeats thermalmonitord claw-back)
+
+/// Every 1s, re-push each held fan's target. setMode(.constant) re-does
+/// the unlock fast-path (cheap once already unlocked) + the F{i}Tg write,
+/// so the physical fan stays where the user pinned it even as the
+/// firmware tries to claw F{i}Tg back. No IPC — this is all in-process
+/// root SMC writes.
+let reassertQueue = DispatchQueue(label: "dev.foltyn.gfc.helper.reassert")
+let reassertTimer = DispatchSource.makeTimerSource(queue: reassertQueue)
+reassertTimer.schedule(deadline: .now() + 1, repeating: 1)
+reassertTimer.setEventHandler {
+    let snap = stateQueue.sync { heldTargets }
+    for (fanID, rpm) in snap {
+        _ = smc.setMode(.constant(rpm: rpm), for: fanID)
+    }
+}
+reassertTimer.resume()
 
 // MARK: - Signal cleanup
 
@@ -114,7 +135,7 @@ func installSignalCleanup(_ sig: Int32, name: String) -> DispatchSourceSignal {
     signal(sig, SIG_IGN)
     let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
     src.setEventHandler {
-        revertAllLockedFans(reason: name)
+        revertAllHeldFans(reason: name)
         unlink(HelperConstants.socketPath)
         _exit(0)
     }
@@ -145,7 +166,7 @@ let watchdogQueue = DispatchQueue(label: "dev.foltyn.gfc.helper.watchdog")
 let watchdog = DispatchSource.makeTimerSource(queue: watchdogQueue)
 watchdog.schedule(deadline: .now() + 10, repeating: 10)
 watchdog.setEventHandler {
-    let (held, last) = stateQueue.sync { (lockedFans, lastActivity) }
+    let (held, last) = stateQueue.sync { (heldTargets, lastActivity) }
     guard !held.isEmpty else { return }
     let idle = Date().timeIntervalSince(last)
     if idle >= IDLE_REVERT_SECONDS {
@@ -153,7 +174,7 @@ watchdog.setEventHandler {
         // seconds (Ftst unlock dance). The watchdog timer fires every
         // 10s and would otherwise pile up.
         DispatchQueue.global(qos: .userInitiated).async {
-            revertAllLockedFans(reason: "idle \(Int(idle))s > \(Int(IDLE_REVERT_SECONDS))s")
+            revertAllHeldFans(reason: "idle \(Int(idle))s > \(Int(IDLE_REVERT_SECONDS))s")
         }
     }
 }
@@ -172,14 +193,19 @@ func process(_ req: HelperRequest) -> HelperResponse {
                               backendName: smc.backendName,
                               protocolVersion: HelperConstants.protocolVersion)
     case .setAuto(let fanID):
+        // Stop holding FIRST so the re-assertion timer can't re-pin it
+        // between our setMode(.auto) and the next tick.
+        release(fanID)
         let ok = smc.setMode(.auto, for: fanID)
-        log("setAuto \(fanID) -> \(ok)")
-        if ok { markUnlocked(fanID) }
+        log("setAuto \(fanID) -> \(ok) (released hold)")
         return HelperResponse(ok: ok, error: ok ? nil : "SMC write rejected")
     case .setConstant(let fanID, let rpm):
         let ok = smc.setMode(.constant(rpm: rpm), for: fanID)
-        log("setConstant \(fanID) \(rpm) -> \(ok)")
-        if ok { markLocked(fanID) }
+        // Register the hold even if this one write was rejected — the
+        // re-assertion timer will keep retrying, and a transient reject
+        // (firmware busy) shouldn't drop the user's intent.
+        if ok { hold(fanID, rpm: rpm) }
+        log("setConstant \(fanID) \(rpm) -> \(ok) (holding)")
         return HelperResponse(ok: ok, error: ok ? nil : "SMC write rejected")
     }
 }

@@ -50,7 +50,15 @@ public enum HelperConstants {
     /// to ~1°C as feedback loops broke). v7 gates the cache hold on
     /// md == 1; firmware reclaim to md=3 now correctly flips us back
     /// to .auto. EMERGENCY upgrade.
-    public static let protocolVersion = 7
+    /// v8 (2026-06-30): ARCHITECTURE FIX. The helper now OWNS the hold:
+    /// it tracks heldTargets and re-asserts CONSTANT on its own 1 Hz
+    /// timer (root, persistent). The unprivileged GUI no longer
+    /// re-asserts (it can't write SMC at all) — it set-once and the
+    /// helper holds. This fixes AUTO (no GUI re-assertion fighting the
+    /// release), constant-not-holding-via-CLI, and the 1 Hz socket
+    /// spam / Ftst-bounce. The v7 helper has no re-assertion timer and
+    /// would let CONSTANT drift; must upgrade.
+    public static let protocolVersion = 8
 }
 
 public enum HelperRequest: Codable {

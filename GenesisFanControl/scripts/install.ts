@@ -132,14 +132,34 @@ if (needsCLIInstall) {
 }
 
 // ─── 4) kill + relaunch ───────────────────────────────────────────────
-
+//
+// CRITICAL: `pkill -x GenesisFanControl` does NOT work — Darwin truncates
+// the process `comm` name to 16 chars (MAXCOMLEN), and "GenesisFanControl"
+// is 17, so the exact-match never fires and the old instance survives.
+// Worse, `open` on an already-running .app just ACTIVATES the stale
+// instance instead of restarting it — so a rebuild's new binary never
+// actually runs (the in-memory process keeps executing old code). This
+// silently defeated dozens of rebuild-test cycles. Match on the full
+// executable path instead (pkill -f), which is reliable and won't hit
+// the lowercase `genesis-fan-control-helper` daemon.
 console.log(`▸ killing existing instance (if any)`)
-await $`pkill -x ${APP_NAME}`.quiet().nothrow()
-// Give launchd / Dock a moment to clean up before reopening from the bundle.
-await Bun.sleep(200)
+// Match `release/GenesisFanControl` — appears in BOTH the symlinked
+// `.build/release/...` path and the resolved `.build/arm64-apple-macosx/
+// release/...` path the process actually runs from. CamelCase so it can't
+// match the lowercase `genesis-fan-control-helper` daemon.
+const killPattern = `release/${APP_NAME}`
+await $`pkill -f ${killPattern}`.quiet().nothrow()
+// Wait for the process to actually exit before reopening, else `open`
+// re-activates the dying instance.
+for (let i = 0; i < 25; i++) {
+    const still = await $`pgrep -f ${killPattern}`.quiet().nothrow()
+    if (still.exitCode !== 0) break // no match => gone
+    await Bun.sleep(100)
+}
 
-console.log(`▸ open ${APP_PATH}`)
-await $`open ${APP_PATH}`
+console.log(`▸ open ${APP_PATH} (fresh launch)`)
+// -n forces a NEW instance even if LaunchServices thinks one exists.
+await $`open -n ${APP_PATH}`
 
 console.log(``)
 console.log(`✓ ${APP_NAME} launched from ${APP_PATH}`)
