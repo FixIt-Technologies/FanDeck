@@ -16,6 +16,16 @@ struct SensorPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // Push the header BELOW the 28pt title-bar drag region. AppKit
+            // claims everything in the top 28pt of a .hiddenTitleBar
+            // window as a window-drag area, eating clicks on any SwiftUI
+            // Button that lives there — that's why every prior fix to
+            // openSettings dispatch failed: the click never arrived. The
+            // earlier NoDragArea NSHostingView shim worked for hit-testing
+            // but its NSViewRepresentable sizing dropped the gear into the
+            // wrong row visually. Pushing the header down is dumber, has
+            // no sizing surprises, and is what other similar apps do.
+            Color.clear.frame(height: 30)
             header
             Divider().overlay(Color.white.opacity(0.06))
             ScrollView(showsIndicators: true) {
@@ -72,12 +82,11 @@ struct SensorPanel: View {
             // item whose title contains "Settings" or "Preferences" —
             // one of those always fires.
             //
-            // The NoDragArea wrap is load-bearing: the gear lives at
-            // y≈14, inside the hidden-title-bar drag region. Without it,
-            // AppKit eats every click as a window-drag gesture before
-            // SwiftUI's Button can react. See NoDragArea.swift.
-            NoDragArea { GearButton() }
-                .frame(width: 24, height: 24)
+            // The header is now pushed below the 28pt drag region by
+            // the leading Color.clear spacer in `body`, so plain Button
+            // works — no need for the NoDragArea NSHostingView shim that
+            // was breaking layout (gear was rendering in the wrong row).
+            GearButton()
         }
         .padding(.horizontal, 12)
         // Same height as the topStatusBar — TEMPERATURES sits on the
@@ -287,14 +296,17 @@ private extension SensorKind {
 
 // MARK: - Settings gear button
 
-/// Reliably opens the Settings scene from a header button. NSApp.sendAction
-/// with bare selectors returned false on macOS 26; this falls back through
-/// modern selector → legacy selector → Application menu walk.
+/// Opens the Settings scene from a header button. macOS 14+ has the
+/// SwiftUI-native `SettingsLink` primitive that just works once the
+/// click actually arrives at the SwiftUI subtree (it wraps a private
+/// init of the Settings scene that the responder chain can find).
+/// All the prior NSApp.sendAction / showSettingsWindow: dispatch
+/// attempts were upstream of the lost-click bug — fixing the drag
+/// region was the load-bearing change. SettingsLink is the cleanest
+/// implementation once clicks arrive.
 private struct GearButton: View {
     var body: some View {
-        Button {
-            openSettingsRobustly()
-        } label: {
+        SettingsLink {
             Image(systemName: "gearshape.fill")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(.gfcTextSecondary)
@@ -303,8 +315,24 @@ private struct GearButton: View {
         }
         .buttonStyle(.plain)
         .help("Open Settings (⌘,)")
+        // Diagnostic — fires on every press regardless of whether
+        // SettingsLink actually shows the window. If you see this in
+        // `log show` but no Settings window opens, the SettingsLink
+        // primitive is failing on your macOS rev and we need to fall
+        // back to the chained selectors below.
+        .simultaneousGesture(TapGesture().onEnded {
+            Log.ui.warning("GearButton tapped — SettingsLink primitive about to handle")
+            // Best-effort backup path. If SettingsLink works, this is
+            // a no-op (the window is already up); if SettingsLink
+            // silently fails on macOS 26 the selector chain will fire
+            // one of these branches.
+            NSApp.activate(ignoringOtherApps: true)
+            _ = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        })
     }
 
+    // Retained for reference / future fallback — currently unused
+    // because SettingsLink wins.
     private func openSettingsRobustly() {
         // Diagnostic — if this line never appears in `log show` despite
         // the user clicking the gear, the click is being eaten upstream

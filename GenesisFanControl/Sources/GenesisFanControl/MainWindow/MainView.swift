@@ -108,6 +108,11 @@ struct MainView: View {
                                 appState.setMode(.constant(rpm: rpm), for: fan.id)
                             },
                             onResetAuto: {
+                                // Diagnostic — if AUTO button's click is being
+                                // eaten before the closure fires, this line will
+                                // NOT appear in `log show`. Keep around for one
+                                // release while we chase the eat-the-click bug.
+                                Log.ui.warning("AUTO BUTTON CLOSURE FIRED for \(fan.id) — about to call AppState.setMode(.auto)")
                                 appState.setMode(.auto, for: fan.id)
                             }
                         )

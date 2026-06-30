@@ -24,7 +24,14 @@ final class FansCLI {
     init() {
         // The CLI uses the same AppState — but we disable the polling timer
         // (RunLoop-driven) and call `tick()` ourselves when we need fresh data.
-        self.state = AppState(autoStartPolling: false)
+        // CRITICAL: forceSafeReset MUST be false here. AppState's default
+        // `AppleSMCService()` does forceSafeReset=true, which on the GUI is
+        // correct (cold-start safety after a crash). For the CLI it's
+        // catastrophic — every `fans list` would silently revert the user's
+        // pinned CONSTANT back to AUTO, indistinguishable from a bug. Cold-
+        // start safety is the GUI's job; the CLI is a read/write client.
+        let smc: SMCService = AppleSMCService(forceSafeReset: false) ?? MockSMCService()
+        self.state = AppState(smc: smc, autoStartPolling: false)
         state.tick()
     }
 
