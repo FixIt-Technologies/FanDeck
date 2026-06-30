@@ -954,11 +954,23 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
                        || isKnownSentinel
                        || (isCoreCpu && v < 10)
             if isGhost {
-                if let prev = lastValidSensor[key] {
-                    newSensors.append(prev)
-                }
-                // No prior valid → omit entirely (don't seed the cache
-                // with a ghost). Virtual aggregates will exclude it.
+                // Prefer the last good value — smooths a transient
+                // single-tick ghost while the chip is active. But NEVER
+                // hide the sensor: if we have no prior good value (deep
+                // idle right after launch, all cores power-gated at
+                // once), show the raw reading anyway. An occasionally
+                // wrong number beats an empty CPU section. We do NOT
+                // seed lastValidSensor with a ghost, so the moment a
+                // real read lands it takes over.
+                //
+                // (Proper fix tracked for follow-up: read live
+                // cluster temps via IOHIDEventSystemClient — pACC MTR /
+                // eACC MTR / GPU MTR — which the firmware keeps awake
+                // and never power-gate. The SMC Tp*/Tg* per-core keys
+                // are fundamentally unreliable at idle on Apple Silicon.)
+                let shown = lastValidSensor[key]
+                    ?? TempSensor(id: key, name: name, kind: kind, celsius: v)
+                newSensors.append(shown)
                 continue
             }
             let s = TempSensor(id: key, name: name, kind: kind, celsius: v)

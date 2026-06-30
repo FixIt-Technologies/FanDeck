@@ -113,11 +113,14 @@ struct DraggableRPMGauge: View {
                     .fill(Color.white.opacity(0.08))
                     .frame(height: height)
 
-                // Live RPM fill — during drag we drive it directly from the
-                // cursor so it tracks 1:1; otherwise we animate to fan.currentRPM.
-                // Shadow is kept tight (radius 2) so at high RPM the soft
-                // colored glow doesn't extend past the SetpointWall and
-                // make the bar look like it overshoots the manual target.
+                // Live RPM fill — ALWAYS the real, physical current RPM.
+                // It does NOT snap to the tap/drag position; the amber
+                // SetpointWall shows where you're pinning to, and the
+                // green fill ramps up to meet it over the next few
+                // seconds as the fan physically spins up. (User report:
+                // tapping 70% used to jump the fill straight to 70%
+                // instead of climbing — the fill followed dragRPM. Now
+                // only the wall moves on tap; the fill stays honest.)
                 Capsule()
                     .fill(
                         LinearGradient(
@@ -129,8 +132,7 @@ struct DraggableRPMGauge: View {
                     .frame(width: max(8, geo.size.width * CGFloat(displayedFraction)),
                            height: height)
                     .shadow(color: fan.loadColor.opacity(0.3), radius: 2)
-                    .animation(isDragging ? nil : .easeOut(duration: 1.0),
-                               value: displayedFraction)
+                    .animation(.easeOut(duration: 1.0), value: displayedFraction)
 
                 // Setpoint wall — amber for manual constant, cyan for the
                 // live sensor-based target. Always shows the RPM label so
@@ -214,15 +216,13 @@ struct DraggableRPMGauge: View {
         return nil
     }
 
-    /// 0…1 width fraction for the fill. While dragging we pin it to the
-    /// cursor so the bar tracks the finger; otherwise we follow the live
-    /// fan reading.
+    /// 0…1 width fraction for the green fill — ALWAYS the live physical
+    /// fan reading, never the drag position. The amber SetpointWall is
+    /// what tracks the finger/target; the fill ramps up to meet it as
+    /// the fan actually spins up.
     private var displayedFraction: Double {
-        let rpm: Int
-        if let dragRPM { rpm = dragRPM }
-        else { rpm = fan.currentRPM }
         let range = max(1, fan.maxRPM - fan.minRPM)
-        return max(0, min(1, Double(rpm - fan.minRPM) / Double(range)))
+        return max(0, min(1, Double(fan.currentRPM - fan.minRPM) / Double(range)))
     }
 
     private func rpmFor(x: CGFloat, totalWidth: CGFloat) -> Int {
