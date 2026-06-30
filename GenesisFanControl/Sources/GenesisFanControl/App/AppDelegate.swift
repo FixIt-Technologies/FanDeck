@@ -164,16 +164,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// When the main window closes, drop back to the user's chosen policy
-    /// so the dock icon honors the setting once they're done.
+    /// When the last of our windows (main OR Settings) closes, drop back to
+    /// the user's chosen policy so the dock icon honors the setting once
+    /// they're done. Keyed on BOTH windows — demoting on main-close alone
+    /// would strip the dock icon / ⌘-Tab presence while the Settings window
+    /// is still visible, orphaning it (review MED).
     private func mainWindowWillClose(_ note: Notification) {
-        guard let win = note.object as? NSWindow,
-              win.identifier?.rawValue == "main" else { return }
+        guard let win = note.object as? NSWindow else { return }
+        let id = win.identifier?.rawValue ?? ""
+        guard id == "main" || id.contains("Settings") else { return }
         // Hold any previous pending demote first — otherwise rapid
         // close/open/close stacks them.
         demoteWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            Task { @MainActor in self?.applyActivationPolicy() }
+            Task { @MainActor in
+                guard let self else { return }
+                // Only demote once neither of our windows is still visible —
+                // otherwise we'd strip the dock icon / ⌘-Tab presence while
+                // the user is still looking at the other window.
+                let stillVisible = NSApp.windows.contains { w in
+                    guard w.isVisible else { return false }
+                    let wid = w.identifier?.rawValue ?? ""
+                    return wid == "main" || wid.contains("Settings")
+                }
+                if !stillVisible { self.applyActivationPolicy() }
+            }
         }
         demoteWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
@@ -426,9 +441,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func menuBarClicked(_ sender: Any?) {
+        // .accessory apps order windows 'from a non-active application' so
+        // they land behind the frontmost app, and on macOS 14+ NSApp.activate
+        // is a cooperative request that may be denied. Go .regular FIRST so
+        // the window can come forward; windowDidBecomeKey keeps us .regular and
+        // mainWindowWillClose restores the user's policy on close.
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
         NSApp.activate(ignoringOtherApps: true)
         if let win = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" }) {
             win.makeKeyAndOrderFront(nil)
+            DispatchQueue.main.async { win.orderFrontRegardless() }
         }
     }
 }

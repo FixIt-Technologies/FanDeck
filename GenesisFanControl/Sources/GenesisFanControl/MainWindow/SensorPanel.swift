@@ -76,11 +76,10 @@ struct SensorPanel: View {
             // Bare NSApp.sendAction("showSettingsWindow:") was returning
             // false on macOS 26 — the responder chain lookup wasn't
             // landing on the Settings scene's installed handler. The
-            // GearButton wrapper activates the app first, then tries
-            // the modern selector, the legacy "showPreferencesWindow:"
-            // selector, and finally walks the application menu for any
-            // item whose title contains "Settings" or "Preferences" —
-            // one of those always fires.
+            // GearButton wrapper promotes to .regular, activates the app,
+            // then calls the real openSettings() env action; the legacy
+            // selectors and an application-menu scrape remain only as a
+            // guarded fallback if openSettings() produces no window.
             //
             // The header is now pushed below the 28pt drag region by
             // the leading Color.clear spacer in `body`, so plain Button
@@ -309,17 +308,22 @@ private extension SensorKind {
 
 /// Opens the Settings scene from a header button.
 ///
-/// macOS 14 ships `SettingsLink` as the canonical way to invoke the
-/// Settings scene from inside a view, but it's BROKEN when the app's
-/// activation policy is `.accessory` (no dock icon) — clicking the
-/// link silently does nothing because there's no foreground regular
-/// app to host the Settings window. Verified empirically: the
-/// `GearButton tapped` log fires; no Settings window appears.
+/// macOS 14 ships `SettingsLink` / `@Environment(\.openSettings)` as the
+/// canonical way to invoke the Settings scene from inside a view, but on an
+/// `.accessory` app (no dock icon) the window still opens BEHIND the
+/// foreground app because the policy isn't `.regular` and the activation
+/// request is cooperative. Verified empirically: the `GearButton tapped`
+/// log fires; no Settings window visibly appears.
 ///
-/// Workaround: a plain `Button` that (a) promotes the app to
-/// `.regular` momentarily and (b) dispatches `showSettingsWindow:` to
-/// the responder chain. This works regardless of starting policy.
+/// Recipe (per SwiftOpenNewWindow.md): (a) promote to `.regular` and
+/// activate first, (b) call the real `openSettings()` env action as PRIMARY,
+/// (c) poll for the Settings window and force it key+front+centered. The
+/// legacy `showSettingsWindow:` / `showPreferencesWindow:` selectors and a
+/// menu-scrape are kept only as a guarded fallback for when `openSettings()`
+/// produces no window.
 private struct GearButton: View {
+    @Environment(\.openSettings) private var openSettings
+
     var body: some View {
         Button {
             openSettingsRobustly()
@@ -338,27 +342,24 @@ private struct GearButton: View {
         Log.ui.warning("GearButton tapped — entering openSettingsRobustly()")
 
         // The Settings scene won't COME FORWARD unless the app is .regular
-        // and active. .accessory apps can dispatch showSettingsWindow:
-        // successfully (the selector returns true) yet the window-server
-        // never brings the window to front — which is exactly the bug:
-        // the log said "opened via showSettingsWindow:" but nothing
-        // appeared. Promote, activate, dispatch, THEN explicitly hunt the
-        // Settings window and raise it (it's created asynchronously, so we
-        // poll for it on the next few run-loop turns).
+        // and active. Even the canonical openSettings() opens the window
+        // BEHIND the foreground app from an .accessory policy. Promote,
+        // activate, then invoke the real SwiftUI env action — the app has a
+        // live SwiftUI graph (the main Window scene), so it dispatches to the
+        // Settings scene. The window is created asynchronously, so we then
+        // hunt for it and raise it over the next few run-loop turns.
         if NSApp.activationPolicy() != .regular {
             NSApp.setActivationPolicy(.regular)
         }
         NSApp.activate(ignoringOtherApps: true)
 
-        let dispatched =
-            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) ||
-            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil) ||
-            openSettingsViaMenu()
-        Log.ui.warning("Settings dispatch result=\(dispatched) — now raising the window")
+        // PRIMARY: the real @Environment(\.openSettings) action.
+        openSettings()
 
         // The SwiftUI Settings window materialises a beat after the action
-        // fires. Poll up to ~1s for it and force it key+front+centered.
-        raiseSettingsWindow(attempt: 0)
+        // fires. Poll up to ~1s for it and force it key+front+centered; if it
+        // never appears, fall back to the legacy selector + menu-scrape.
+        raiseSettingsWindow(attempt: 0, didFallback: false)
     }
 
     private func openSettingsViaMenu() -> Bool {
@@ -381,7 +382,7 @@ private struct GearButton: View {
     /// names it "com_apple_SwiftUI_Settings_window"; we also match by title
     /// as a fallback. Retries a few times because the window is created
     /// asynchronously after showSettingsWindow: dispatches.
-    private func raiseSettingsWindow(attempt: Int) {
+    private func raiseSettingsWindow(attempt: Int, didFallback: Bool) {
         let win = NSApp.windows.first { w in
             (w.identifier?.rawValue.contains("Settings") ?? false) ||
             w.title.localizedCaseInsensitiveContains("settings") ||
@@ -396,11 +397,23 @@ private struct GearButton: View {
             return
         }
         guard attempt < 10 else {
-            Log.ui.error("Settings window never appeared after dispatch (policy=\(NSApp.activationPolicy().rawValue))")
+            // openSettings() produced no window after ~1s. As a guarded
+            // fallback, try the legacy selector dispatch + menu-scrape ONCE,
+            // then poll again. If that also yields nothing, give up.
+            guard !didFallback else {
+                Log.ui.error("Settings window never appeared after openSettings() + fallback (policy=\(NSApp.activationPolicy().rawValue))")
+                return
+            }
+            let dispatched =
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) ||
+                NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil) ||
+                openSettingsViaMenu()
+            Log.ui.warning("openSettings() yielded no window; legacy fallback dispatched=\(dispatched)")
+            raiseSettingsWindow(attempt: 0, didFallback: true)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            raiseSettingsWindow(attempt: attempt + 1)
+            raiseSettingsWindow(attempt: attempt + 1, didFallback: didFallback)
         }
     }
 }

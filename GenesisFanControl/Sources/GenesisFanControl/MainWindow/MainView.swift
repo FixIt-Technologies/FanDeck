@@ -15,7 +15,6 @@ import GenesisFanControlCore
 struct MainView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var settings: SettingsStore
-    @Environment(\.openSettings) private var openSettings
     @State private var configuringFanID: String?
 
     private let sensorPanelWidth: CGFloat = 280
