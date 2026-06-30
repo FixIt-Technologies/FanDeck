@@ -122,14 +122,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         Log.lifecycle.warning("applicationWillTerminate — reverting all non-auto fans to AUTO")
         let state = AppState.shared
-        let nonAuto = state.fans.filter {
-            if case .auto = $0.mode { return false } else { return true }
-        }
-        guard !nonAuto.isEmpty else { return }
+        let nonAutoIDs = MaxHoldDecider.nonAutoFanIDs(fans: state.fans)
+        guard !nonAutoIDs.isEmpty else { return }
         // setMode dispatches async on smcQueue. Block briefly so we
         // give the writes a chance to land before the process exits.
-        for fan in nonAuto {
-            state.setMode(.auto, for: fan.id)
+        for id in nonAutoIDs {
+            state.setMode(.auto, for: id)
         }
         // Give smcQueue ~1.5s to drain — enough for two Ftst dances
         // worst-case. Past that the process is going away regardless.
@@ -141,7 +139,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func applyActivationPolicy() {
         let showDock = SettingsStore.shared.showDockIcon
-        let policy: NSApplication.ActivationPolicy = showDock ? .regular : .accessory
+        let intent = ActivationPolicyDecider.targetPolicy(showDockIcon: showDock)
+        let policy: NSApplication.ActivationPolicy = intent == .regular ? .regular : .accessory
         NSApp.setActivationPolicy(policy)
         Log.lifecycle.info("Activation policy → \(showDock ? "regular" : "accessory")")
     }
@@ -152,7 +151,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// closes (see `mainWindowWillClose`).
     private func windowDidBecomeKey(_ note: Notification) {
         guard let win = note.object as? NSWindow,
-              win.identifier?.rawValue == "main" else { return }
+              ActivationPolicyDecider.shouldPromoteOnKeyWindow(
+                  identifier: win.identifier?.rawValue ?? "") else { return }
         // Cancel any pending demote — the user re-opened the window
         // before our 300ms grace expired, so the demote is stale and
         // would silently strip the dock icon they're now seeing.
@@ -172,22 +172,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func mainWindowWillClose(_ note: Notification) {
         guard let win = note.object as? NSWindow else { return }
         let id = win.identifier?.rawValue ?? ""
-        guard id == "main" || id.contains("Settings") else { return }
+        // shouldDemote with [] as the id-guard: returns false for non-managed
+        // IDs (guard fails → return), true for managed IDs with no other
+        // managed windows (empty list) → schedules the work item. The real
+        // decision (with live visible IDs) is made inside the work item.
+        guard ActivationPolicyDecider.shouldDemote(closingID: id, visibleWindowIDs: []) else { return }
         // Hold any previous pending demote first — otherwise rapid
         // close/open/close stacks them.
         demoteWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
-                // Only demote once neither of our windows is still visible —
-                // otherwise we'd strip the dock icon / ⌘-Tab presence while
-                // the user is still looking at the other window.
-                let stillVisible = NSApp.windows.contains { w in
-                    guard w.isVisible else { return false }
-                    let wid = w.identifier?.rawValue ?? ""
-                    return wid == "main" || wid.contains("Settings")
+                let visibleWindowIDs = NSApp.windows
+                    .filter(\.isVisible)
+                    .compactMap { $0.identifier?.rawValue }
+                if ActivationPolicyDecider.shouldDemote(closingID: id,
+                                                        visibleWindowIDs: visibleWindowIDs) {
+                    self.applyActivationPolicy()
                 }
-                if !stillVisible { self.applyActivationPolicy() }
             }
         }
         demoteWorkItem = item
@@ -201,14 +203,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func systemDidWake() {
-        let nonAuto = AppState.shared.fans.filter {
-            if case .auto = $0.mode { return false } else { return true }
-        }
-        guard !nonAuto.isEmpty else { return }
-        Log.lifecycle.info("System did wake — re-asserting \(nonAuto.count) non-auto fan(s)")
-        for fan in nonAuto {
-            // Re-issue the same mode the user previously set. setMode
-            // runs the full unlock dance + write through smcQueue.
+        let allFans = AppState.shared.fans
+        let nonAutoIDs = MaxHoldDecider.nonAutoFanIDs(fans: allFans)
+        guard !nonAutoIDs.isEmpty else { return }
+        Log.lifecycle.info("System did wake — re-asserting \(nonAutoIDs.count) non-auto fan(s)")
+        // Re-issue each fan's mode from the wake-time snapshot — same
+        // mode the user previously set. setMode runs the full unlock
+        // dance + write through smcQueue.
+        for fan in allFans where nonAutoIDs.contains(fan.id) {
             AppState.shared.setMode(fan.mode, for: fan.id)
         }
     }
@@ -237,16 +239,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func checkMaxHold() {
         let now = Date()
-        for (fanID, since) in holdSince {
-            let held = now.timeIntervalSince(since)
-            guard held >= maxHoldSeconds else { continue }
-            // Only act if the fan is actually still non-auto — the user
-            // might have switched it back via the gauge's Auto button.
+        let fans = AppState.shared.fans
+        let currentModes = Dictionary(uniqueKeysWithValues: fans.map { ($0.id, $0.mode) })
+        let toRevert = MaxHoldDecider.fansToRevert(
+            holdSince: holdSince, now: now,
+            maxHold: maxHoldSeconds, currentModes: currentModes
+        )
+        for fanID in toRevert {
+            let held = now.timeIntervalSince(holdSince[fanID] ?? now)
             guard let fan = AppState.shared.fan(withID: fanID) else {
-                holdSince.removeValue(forKey: fanID)
-                continue
-            }
-            if case .auto = fan.mode {
                 holdSince.removeValue(forKey: fanID)
                 continue
             }
@@ -255,6 +256,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             holdSince.removeValue(forKey: fanID)
             notifyMaxHold(fanID: fanID, fan: fan)
         }
+        // Safety-net: clean up stale holdSince entries for fans that have
+        // disappeared or switched to auto (fansToRevert excludes these;
+        // userSetModeFired removes auto transitions proactively but races
+        // are possible, so we also clean up here when held >= maxHoldSeconds).
+        let toClean = holdSince.keys.filter { fanID in
+            guard now.timeIntervalSince(holdSince[fanID]!) >= maxHoldSeconds else { return false }
+            guard let mode = currentModes[fanID] else { return true } // fan gone
+            if case .auto = mode { return true }                       // fan is auto
+            return false
+        }
+        for fanID in toClean { holdSince.removeValue(forKey: fanID) }
     }
 
     private func notifyMaxHold(fanID: String, fan: Fan) {
@@ -300,61 +312,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settings = SettingsStore.shared
         let state = AppState.shared
 
-        // Resolve the SF Symbol name (the image is applied below, after the
-        // cache check). The menu bar always uses TEMPLATE images so the glyph
-        // auto-tints to the light/dark menu-bar background; `.color` uses the
-        // fill variant, the actual color comes from the system.
-        let symbol: String
-        switch settings.menuBarIconStyle {
-        case .color:       symbol = "fanblades.fill"
-        case .monochrome:  symbol = "fanblades"
-        case .temperature: symbol = "thermometer.medium"
-        }
+        // Resolve the SF Symbol name and compose the title text via the
+        // MenuBarContent seam. The seam owns the icon/text logic so the
+        // tests guard exactly this production path.
+        let symbol = MenuBarContent.symbol(for: settings.menuBarIconStyle)
 
-        // Title (right of the icon). Compose: optional fan readout +
-        // up to two selected sensor temps. Keep it under ~24 chars so
-        // it doesn't blow out the menu bar.
-        var parts: [String] = []
-
-        // Headline temp if user picked .temperature style
-        if settings.menuBarIconStyle == .temperature,
-           let s = state.headlineSensor {
-            parts.append(s.formatted(useFahrenheit: settings.useFahrenheit, precise: false))
-        }
-
-        // Optional fan readout
-        switch settings.menuBarFan {
-        case .none:
-            break
-        case .rpm:
-            if let f = state.fans.first {
-                parts.append("\(f.currentRPM) RPM")
-            }
-        case .percent:
-            if let f = state.fans.first {
-                let pct = Int((f.loadFraction * 100).rounded())
-                parts.append("\(pct)%")
-            }
-        }
-
-        // Up to 2 sensor temps the user selected
-        let pickedIDs = Array(settings.menuBarSensorIDs.prefix(2))
-        for id in pickedIDs {
-            if let s = state.sensor(withID: id) {
-                parts.append(s.formatted(useFahrenheit: settings.useFahrenheit, precise: false))
-            }
-        }
-
-        let titleText = parts.isEmpty ? "" : " " + parts.joined(separator: " · ")
+        let pickedSensors = Array(settings.menuBarSensorIDs.prefix(2))
+            .compactMap { state.sensor(withID: $0) }
+        let titleText = MenuBarContent.title(
+            style: settings.menuBarIconStyle,
+            menuBarFan: settings.menuBarFan,
+            firstFan: state.fans.first,
+            headlineSensor: state.headlineSensor,
+            pickedSensors: pickedSensors,
+            useFahrenheit: settings.useFahrenheit
+        )
 
         // Output cache (Focus B2): skip all NSImage / NSAttributedString
         // allocation + status-item reassignment when nothing the menu bar
         // shows has changed. Invoked 2×/tick ($fans + $sensors) with stable
         // RPM + rounded temps at idle → collapses ~2 byte-identical rebuilds
-        // /sec to ~0. The cached `labelColor` in the existing attributedTitle
-        // still re-resolves on a light/dark appearance switch, so skipping
-        // the rebuild is safe.
-        if symbol == lastMenuBarSymbol && titleText == lastMenuBarTitle { return }
+        // /sec to ~0.
+        if MenuBarContent.shouldSkip(symbol: symbol, title: titleText,
+                                     lastSymbol: lastMenuBarSymbol,
+                                     lastTitle: lastMenuBarTitle) { return }
         lastMenuBarSymbol = symbol
         lastMenuBarTitle = titleText
 

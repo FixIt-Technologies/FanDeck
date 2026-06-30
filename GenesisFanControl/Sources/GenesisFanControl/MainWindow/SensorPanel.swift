@@ -384,36 +384,36 @@ private struct GearButton: View {
     /// asynchronously after showSettingsWindow: dispatches.
     private func raiseSettingsWindow(attempt: Int, didFallback: Bool) {
         let win = NSApp.windows.first { w in
-            (w.identifier?.rawValue.contains("Settings") ?? false) ||
-            w.title.localizedCaseInsensitiveContains("settings") ||
-            w.title.localizedCaseInsensitiveContains("preferences")
+            SettingsWindowDispatch.isSettingsWindow(
+                identifier: w.identifier?.rawValue,
+                title: w.title)
         }
-        if let win {
+        switch SettingsWindowDispatch.nextAction(attempt: attempt,
+                                                 didFallback: didFallback,
+                                                 found: win != nil) {
+        case .raise:
+            guard let w = win else { return }
             NSApp.activate(ignoringOtherApps: true)
-            win.center()
-            win.makeKeyAndOrderFront(nil)
-            win.orderFrontRegardless()
-            Log.ui.warning("Settings window raised: '\(win.title)' id=\(win.identifier?.rawValue ?? "—")")
-            return
-        }
-        guard attempt < 10 else {
+            w.center()
+            w.makeKeyAndOrderFront(nil)
+            w.orderFrontRegardless()
+            Log.ui.warning("Settings window raised: '\(w.title)' id=\(w.identifier?.rawValue ?? "—")")
+        case .retry:
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                raiseSettingsWindow(attempt: attempt + 1, didFallback: didFallback)
+            }
+        case .tryFallback:
             // openSettings() produced no window after ~1s. As a guarded
             // fallback, try the legacy selector dispatch + menu-scrape ONCE,
-            // then poll again. If that also yields nothing, give up.
-            guard !didFallback else {
-                Log.ui.error("Settings window never appeared after openSettings() + fallback (policy=\(NSApp.activationPolicy().rawValue))")
-                return
-            }
+            // then poll again from the top. If that also yields nothing, give up.
             let dispatched =
                 NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) ||
                 NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil) ||
                 openSettingsViaMenu()
             Log.ui.warning("openSettings() yielded no window; legacy fallback dispatched=\(dispatched)")
             raiseSettingsWindow(attempt: 0, didFallback: true)
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            raiseSettingsWindow(attempt: attempt + 1, didFallback: didFallback)
+        case .giveUp:
+            Log.ui.error("Settings window never appeared after openSettings() + fallback (policy=\(NSApp.activationPolicy().rawValue))")
         }
     }
 }

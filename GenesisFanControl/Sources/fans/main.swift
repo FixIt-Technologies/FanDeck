@@ -36,24 +36,37 @@ final class FansCLI {
     }
 
     func run(args: [String]) throws -> Int32 {
-        guard let command = args.first else {
-            printUsage()
-            return 0
-        }
-        switch command {
-        case "list":         return cmdList()
-        case "get":          return cmdGet(args: Array(args.dropFirst()))
-        case "sensors":      return cmdSensors()
-        case "sensor":       return cmdSensor(args: Array(args.dropFirst()))
-        case "set":          return cmdSet(args: Array(args.dropFirst()))
-        case "watch":        return cmdWatch(args: Array(args.dropFirst()))
-        case "-h", "--help", "help":
-            printUsage()
-            return 0
-        default:
-            FileHandle.standardError.write(Data("Unknown command: \(command)\n\n".utf8))
-            printUsage()
+        let parsed: ParsedCommand
+        do {
+            parsed = try CLIParser.parse(args)
+        } catch let err as CLIParseError {
+            switch err {
+            case .unknownCommand(let cmd):
+                FileHandle.standardError.write(Data("Unknown command: \(cmd)\n\n".utf8))
+                printUsage()
+            case .missingArguments(let hint):
+                FileHandle.standardError.write(Data("Usage:\n  \(hint)\n".utf8))
+            case .badRPM(let s):
+                FileHandle.standardError.write(Data("fans set <fanID> const <rpm>  (got '\(s)')\n".utf8))
+            case .badSensorTemp(let s):
+                FileHandle.standardError.write(Data("Bad temperature value '\(s)' — expected a number\n".utf8))
+            case .badRampPoint(let s):
+                FileHandle.standardError.write(Data("Bad point '\(s)' — expected <tempC>:<rpm>\n".utf8))
+            case .rampTooFew:
+                FileHandle.standardError.write(Data("ramp needs at least 2 points\n".utf8))
+            }
             return 64
+        }
+        switch parsed {
+        case .list:                     return cmdList()
+        case .sensors:                  return cmdSensors()
+        case .help:
+            printUsage()
+            return 0
+        case .get(let fanID):           return cmdGet(args: [fanID])
+        case .sensor(let id):           return cmdSensor(args: [id])
+        case .set(let fanID, let spec): return cmdSet(fanID: fanID, spec: spec)
+        case .watch(let interval):      return cmdWatch(interval: interval)
         }
     }
 
@@ -130,80 +143,24 @@ final class FansCLI {
         return 0
     }
 
-    private func cmdSet(args: [String]) -> Int32 {
-        guard args.count >= 2 else {
-            FileHandle.standardError.write(Data("""
-            Usage:
-              fans set <fanID> auto
-              fans set <fanID> const <rpm>
-              fans set <fanID> sensor <sensorID> <lowC> <highC>          (2-point ramp, lo→minRPM, hi→maxRPM)
-              fans set <fanID> ramp   <sensorID> <c1:rpm1> <c2:rpm2> ...  (N-point ramp, ≥2 points)
-
-            """.utf8))
-            return 64
-        }
-        let fanID = args[0]
+    private func cmdSet(fanID: String, spec: SetModeSpec) -> Int32 {
         guard let fan = state.fan(withID: fanID) else {
             FileHandle.standardError.write(Data("Unknown fan: \(fanID)\n".utf8))
             return 65
         }
-        let kind = args[1]
-        let mode: FanMode
-        switch kind {
-        case "auto":
-            mode = .auto
-        case "const":
-            guard let rpm = Int(args[safe: 2] ?? "") else {
-                FileHandle.standardError.write(Data("fans set <fanID> const <rpm>\n".utf8))
-                return 64
-            }
-            mode = .constant(rpm: rpm)
-        case "sensor":
-            guard args.count >= 5,
-                  let low = Double(args[3]),
-                  let high = Double(args[4]) else {
-                FileHandle.standardError.write(Data("fans set <fanID> sensor <sensorID> <lowC> <highC>\n".utf8))
-                return 64
-            }
-            let sid = args[2]
+        // Validate runtime-only preconditions that CLIParser can't check
+        // (it's pure; has no AppState access). For sensor/ramp modes, confirm
+        // the sensor actually exists in the current SMC snapshot.
+        switch spec {
+        case .sensor(let sid, _, _), .ramp(let sid, _):
             guard state.sensor(withID: sid) != nil else {
                 FileHandle.standardError.write(Data("Unknown sensor: \(sid)\n".utf8))
                 return 65
             }
-            mode = .sensorBased(sensorId: sid,
-                                lowTempC: low, highTempC: high,
-                                minRPM: fan.minRPM, maxRPM: fan.maxRPM)
-        case "ramp":
-            // fans set F0 ramp <sensorID> <c:rpm> <c:rpm> ...
-            guard args.count >= 5 else {
-                FileHandle.standardError.write(Data("fans set <fanID> ramp <sensorID> <c1:rpm1> <c2:rpm2> ...\n".utf8))
-                return 64
-            }
-            let sid = args[2]
-            guard state.sensor(withID: sid) != nil else {
-                FileHandle.standardError.write(Data("Unknown sensor: \(sid)\n".utf8))
-                return 65
-            }
-            var pts: [RampPoint] = []
-            for raw in args.dropFirst(3) {
-                let parts = raw.split(separator: ":").map(String.init)
-                guard parts.count == 2,
-                      let c = Double(parts[0]),
-                      let r = Int(parts[1]) else {
-                    FileHandle.standardError.write(Data("Bad point '\(raw)' — expected <tempC>:<rpm>\n".utf8))
-                    return 64
-                }
-                pts.append(RampPoint(tempC: c, rpm: r))
-            }
-            guard pts.count >= 2 else {
-                FileHandle.standardError.write(Data("ramp needs at least 2 points\n".utf8))
-                return 64
-            }
-            mode = .sensorBased(sensorId: sid, points: pts)
         default:
-            FileHandle.standardError.write(Data("Unknown mode: \(kind) (use auto|const|sensor|ramp)\n".utf8))
-            return 64
+            break
         }
+        let mode = CLIParser.fanMode(from: spec, fanMin: fan.minRPM, fanMax: fan.maxRPM)
         // Call the SMC service SYNCHRONOUSLY. state.setMode() dispatches
         // onto AppState's smcQueue and returns immediately — but the CLI
         // process exits right after, so that async write would never run
@@ -220,8 +177,7 @@ final class FansCLI {
         }
     }
 
-    private func cmdWatch(args: [String]) -> Int32 {
-        let interval = TimeInterval(args.first.flatMap(Double.init) ?? 1.0)
+    private func cmdWatch(interval: TimeInterval) -> Int32 {
         print("Watching every \(interval)s — Ctrl-C to stop.\n")
         while true {
             state.tick()
@@ -270,12 +226,6 @@ final class FansCLI {
           with an IOKit AppleSMC implementation to drive real fans.
         """
         print(text)
-    }
-}
-
-private extension Array {
-    subscript(safe i: Int) -> Element? {
-        return indices.contains(i) ? self[i] : nil
     }
 }
 

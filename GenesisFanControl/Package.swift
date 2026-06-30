@@ -10,6 +10,10 @@ let package = Package(
         .executable(name: "genesis-fan-control-helper", targets: ["GenesisFanControlHelper"]),
         .library(name: "GenesisFanControlCore", targets: ["GenesisFanControlCore"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/nalexn/ViewInspector",
+                 .upToNextMajor(from: "0.9.11")),
+    ],
     targets: [
         .target(
             name: "GenesisFanControlCore",
@@ -32,7 +36,11 @@ let package = Package(
         ),
         .testTarget(
             name: "GenesisFanControlTests",
-            dependencies: ["GenesisFanControlCore"],
+            dependencies: [
+                "GenesisFanControlCore",
+                "GenesisFanControl",
+                .product(name: "ViewInspector", package: "ViewInspector"),
+            ],
             path: "Tests/GenesisFanControlTests"
         ),
     ]

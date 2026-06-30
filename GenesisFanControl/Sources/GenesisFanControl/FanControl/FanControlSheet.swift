@@ -238,126 +238,9 @@ struct FanControlSheet: View {
                     Spacer()
                 }
 
-                pointsEditor
+                RampPointsEditor(points: $points, minRPM: fan.minRPM, maxRPM: fan.maxRPM)
             }
         }
-    }
-
-    /// Compact list of ramp vertices — one row per point with both
-    /// temp (°C) and rpm steppers + delete button (disabled when N <= 2).
-    /// "Add point" appends a new vertex halfway between the last two and
-    /// re-sorts. The Chart in livePreviewCard renders the same array
-    /// with draggable handles, so the user can edit either way.
-    private var pointsEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Ramp points")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.gfcText)
-                Spacer()
-                Button {
-                    addPoint()
-                } label: {
-                    Label("Add point", systemImage: "plus.circle.fill")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .buttonStyle(.borderless)
-                .foregroundColor(.gfcCyan)
-            }
-            ForEach(points.indices, id: \.self) { i in
-                pointRow(index: i)
-            }
-            Text("Drag the dots on the graph below to reshape the curve, or edit values here.")
-                .font(.system(size: 10))
-                .foregroundColor(.gfcTextMuted)
-        }
-    }
-
-    @ViewBuilder
-    private func pointRow(index i: Int) -> some View {
-        let binding = pointBinding(at: i)
-        HStack(spacing: 8) {
-            Circle()
-                .fill(pointColor(at: i))
-                .frame(width: 10, height: 10)
-                .shadow(color: pointColor(at: i).opacity(0.7), radius: 3)
-            // Temp: explicit value Text + a labels-hidden Stepper. The
-            // value MUST live outside the Stepper — `.labelsHidden()`
-            // hides the Stepper's label, which is exactly where the old
-            // code put the "45 °C" text, so it rendered blank.
-            Text("at")
-                .font(.system(size: 11))
-                .foregroundColor(.gfcTextMuted)
-            Text("\(Int(points[i].tempC)) °C")
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                .foregroundColor(.gfcText)
-                .frame(minWidth: 52, alignment: .trailing)
-            Stepper("", value: binding.tempC, in: 0...120, step: 1)
-                .labelsHidden()
-            Text("→")
-                .font(.system(size: 11))
-                .foregroundColor(.gfcTextMuted)
-            // RPM: same pattern.
-            Text("\(points[i].rpm) RPM")
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                .foregroundColor(.gfcText)
-                .frame(minWidth: 74, alignment: .trailing)
-            Stepper("", value: binding.rpm, in: fan.minRPM...fan.maxRPM, step: 50)
-                .labelsHidden()
-            Spacer()
-            Button {
-                deletePoint(at: i)
-            } label: {
-                Image(systemName: "trash")
-                    .font(.system(size: 11))
-                    .foregroundColor(points.count > 2 ? .gfcRed : .gfcTextMuted.opacity(0.3))
-            }
-            .buttonStyle(.plain)
-            .disabled(points.count <= 2)
-            .help(points.count > 2 ? "Delete this point" : "Need at least 2 points")
-        }
-        .padding(.vertical, 2)
-    }
-
-    private func pointBinding(at i: Int) -> (tempC: Binding<Double>, rpm: Binding<Int>) {
-        let temp = Binding<Double>(
-            get: { points[safe: i]?.tempC ?? 0 },
-            set: { newVal in
-                guard i < points.count else { return }
-                points[i].tempC = newVal
-                points.sort(by: { $0.tempC < $1.tempC })
-            }
-        )
-        let rpm = Binding<Int>(
-            get: { points[safe: i]?.rpm ?? fan.minRPM },
-            set: { newVal in
-                guard i < points.count else { return }
-                points[i].rpm = max(fan.minRPM, min(fan.maxRPM, newVal))
-            }
-        )
-        return (temp, rpm)
-    }
-
-    private func pointColor(at i: Int) -> Color {
-        if i == 0 { return .gfcGreen }
-        if i == points.count - 1 { return .gfcRed }
-        return .gfcCyan
-    }
-
-    private func addPoint() {
-        let last = points.last ?? RampPoint(tempC: 85, rpm: fan.maxRPM)
-        let prev = points.dropLast().last ?? RampPoint(tempC: 45, rpm: fan.minRPM)
-        let mid = RampPoint(
-            tempC: (prev.tempC + last.tempC) / 2,
-            rpm: (prev.rpm + last.rpm) / 2
-        )
-        points.append(mid)
-        points.sort(by: { $0.tempC < $1.tempC })
-    }
-
-    private func deletePoint(at i: Int) {
-        guard points.count > 2, i < points.count else { return }
-        points.remove(at: i)
     }
 
     // MARK: - Live preview
@@ -578,6 +461,11 @@ struct FanControlSheet: View {
             }
     }
 
+    private func deletePoint(at i: Int) {
+        guard points.count > 2, i < points.count else { return }
+        points.remove(at: i)
+    }
+
     private func addPointAt(location: CGPoint, proxy: ChartProxy, frame: CGRect,
                             xMin: Double, xMax: Double) {
         let inChartX = location.x - frame.minX
@@ -703,6 +591,130 @@ struct FanControlSheet: View {
 
     private func clamped(_ rpm: Int) -> Int {
         max(fan.minRPM, min(fan.maxRPM, rpm))
+    }
+}
+
+// MARK: - Ramp points editor (extracted for testability)
+
+/// The list of ramp vertices rendered inside sensorCard. Extracted as a
+/// standalone internal struct so tests can inspect it directly without
+/// triggering the Charts.Chart code in livePreviewCard, which requires a
+/// live AppKit context and crashes ViewInspector in headless environments.
+struct RampPointsEditor: View {
+    @Binding var points: [RampPoint]
+    let minRPM: Int
+    let maxRPM: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Ramp points")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.gfcText)
+                Spacer()
+                Button {
+                    addPoint()
+                } label: {
+                    Label("Add point", systemImage: "plus.circle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.borderless)
+                .foregroundColor(.gfcCyan)
+            }
+            ForEach(points.indices, id: \.self) { i in
+                pointRow(index: i)
+            }
+            Text("Drag the dots on the graph below to reshape the curve, or edit values here.")
+                .font(.system(size: 10))
+                .foregroundColor(.gfcTextMuted)
+        }
+    }
+
+    @ViewBuilder
+    private func pointRow(index i: Int) -> some View {
+        let binding = pointBinding(at: i)
+        HStack(spacing: 8) {
+            Circle()
+                .fill(pointColor(at: i))
+                .frame(width: 10, height: 10)
+                .shadow(color: pointColor(at: i).opacity(0.7), radius: 3)
+            // Temp: explicit value Text + a labels-hidden Stepper. The
+            // value MUST live outside the Stepper — `.labelsHidden()`
+            // hides the Stepper's label, which is exactly where the old
+            // code put the "45 °C" text, so it rendered blank.
+            Text("at")
+                .font(.system(size: 11))
+                .foregroundColor(.gfcTextMuted)
+            Text("\(Int(points[i].tempC)) °C")
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundColor(.gfcText)
+                .frame(minWidth: 52, alignment: .trailing)
+            Stepper("", value: binding.tempC, in: 0...120, step: 1)
+                .labelsHidden()
+            Text("→")
+                .font(.system(size: 11))
+                .foregroundColor(.gfcTextMuted)
+            // RPM: same pattern.
+            Text("\(points[i].rpm) RPM")
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundColor(.gfcText)
+                .frame(minWidth: 74, alignment: .trailing)
+            Stepper("", value: binding.rpm, in: minRPM...maxRPM, step: 50)
+                .labelsHidden()
+            Spacer()
+            Button {
+                deletePoint(at: i)
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 11))
+                    .foregroundColor(points.count > 2 ? .gfcRed : .gfcTextMuted.opacity(0.3))
+            }
+            .buttonStyle(.plain)
+            .disabled(points.count <= 2)
+            .help(points.count > 2 ? "Delete this point" : "Need at least 2 points")
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func pointBinding(at i: Int) -> (tempC: Binding<Double>, rpm: Binding<Int>) {
+        let temp = Binding<Double>(
+            get: { points[safe: i]?.tempC ?? 0 },
+            set: { newVal in
+                guard i < points.count else { return }
+                points[i].tempC = newVal
+                points.sort(by: { $0.tempC < $1.tempC })
+            }
+        )
+        let rpm = Binding<Int>(
+            get: { points[safe: i]?.rpm ?? minRPM },
+            set: { newVal in
+                guard i < points.count else { return }
+                points[i].rpm = max(minRPM, min(maxRPM, newVal))
+            }
+        )
+        return (temp, rpm)
+    }
+
+    private func pointColor(at i: Int) -> Color {
+        if i == 0 { return .gfcGreen }
+        if i == points.count - 1 { return .gfcRed }
+        return .gfcCyan
+    }
+
+    private func addPoint() {
+        let last = points.last ?? RampPoint(tempC: 85, rpm: maxRPM)
+        let prev = points.dropLast().last ?? RampPoint(tempC: 45, rpm: minRPM)
+        let mid = RampPoint(
+            tempC: (prev.tempC + last.tempC) / 2,
+            rpm: (prev.rpm + last.rpm) / 2
+        )
+        points.append(mid)
+        points.sort(by: { $0.tempC < $1.tempC })
+    }
+
+    private func deletePoint(at i: Int) {
+        guard points.count > 2, i < points.count else { return }
+        points.remove(at: i)
     }
 }
 

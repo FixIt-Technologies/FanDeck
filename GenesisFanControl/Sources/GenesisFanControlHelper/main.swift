@@ -71,7 +71,7 @@ log("listening on \(HelperConstants.socketPath) (root:admin 0660)")
 /// All touches gated by stateQueue (the accept loop, the re-assertion
 /// timer, and the watchdog all run on different queues).
 let stateQueue = DispatchQueue(label: "dev.foltyn.gfc.helper.state")
-nonisolated(unsafe) var heldTargets: [String: Int] = [:]
+nonisolated(unsafe) var holdState = HelperHoldState()
 nonisolated(unsafe) var lastActivity: Date = Date()
 
 @Sendable func recordActivity() {
@@ -79,17 +79,17 @@ nonisolated(unsafe) var lastActivity: Date = Date()
 }
 
 @Sendable func hold(_ fanID: String, rpm: Int) {
-    stateQueue.sync { heldTargets[fanID] = rpm }
+    stateQueue.sync { holdState.hold(fanID, rpm: rpm) }
 }
 
 @Sendable func release(_ fanID: String) {
-    _ = stateQueue.sync { heldTargets.removeValue(forKey: fanID) }
+    stateQueue.sync { holdState.release(fanID) }
 }
 
 /// Revert every held fan to auto. Best-effort. Called from the SIGTERM
 /// handler and the idle watchdog (GUI-crash safety net).
 func revertAllHeldFans(reason: String) {
-    let snap = stateQueue.sync { heldTargets }
+    let snap = stateQueue.sync { holdState.reassertTargets }
     guard !snap.isEmpty else { return }
     log("revertAllHeldFans: \(reason) — reverting \(snap.keys.sorted())")
     for fanID in snap.keys {
@@ -110,7 +110,7 @@ let reassertQueue = DispatchQueue(label: "dev.foltyn.gfc.helper.reassert")
 let reassertTimer = DispatchSource.makeTimerSource(queue: reassertQueue)
 reassertTimer.schedule(deadline: .now() + 1, repeating: 1)
 reassertTimer.setEventHandler {
-    let snap = stateQueue.sync { heldTargets }
+    let snap = stateQueue.sync { holdState.reassertTargets }
     for (fanID, rpm) in snap {
         _ = smc.setMode(.constant(rpm: rpm), for: fanID)
     }
@@ -166,10 +166,16 @@ let watchdogQueue = DispatchQueue(label: "dev.foltyn.gfc.helper.watchdog")
 let watchdog = DispatchSource.makeTimerSource(queue: watchdogQueue)
 watchdog.schedule(deadline: .now() + 10, repeating: 10)
 watchdog.setEventHandler {
-    let (held, last) = stateQueue.sync { (heldTargets, lastActivity) }
-    guard !held.isEmpty else { return }
-    let idle = Date().timeIntervalSince(last)
-    if idle >= IDLE_REVERT_SECONDS {
+    let (targets, last) = stateQueue.sync { (holdState.reassertTargets, lastActivity) }
+    guard !targets.isEmpty else { return }
+    let now = Date()
+    // shouldRevertIdle is pure (uses only its parameters, not self state),
+    // so calling it on a throw-away instance is correct and avoids touching
+    // holdState from outside stateQueue.
+    if HelperHoldState().shouldRevertIdle(lastActivity: last,
+                                          now: now,
+                                          threshold: IDLE_REVERT_SECONDS) {
+        let idle = now.timeIntervalSince(last)
         // Do the revert OUTSIDE stateQueue.sync — setMode can take
         // seconds (Ftst unlock dance). The watchdog timer fires every
         // 10s and would otherwise pile up.
@@ -224,16 +230,6 @@ func consoleUserUID() -> uid_t? {
     return nil
 }
 
-/// Decide whether to accept the connection. Allow root (uid 0) always,
-/// and the active console user. Reject everything else — explicitly
-/// closes off the "any local UID can pin fans at 5800" attack the
-/// world-writable socket allowed.
-func isAuthorizedPeer(uid: uid_t, gid: gid_t) -> Bool {
-    if uid == 0 { return true }
-    if let consoleUID = consoleUserUID(), uid == consoleUID { return true }
-    return false
-}
-
 func handle(client fd: Int32) {
     // Snap timeouts on every accepted fd — a malicious or stuck client
     // can't pin the helper indefinitely. 5s covers a worst-case Ftst
@@ -243,7 +239,7 @@ func handle(client fd: Int32) {
     // Cred check FIRST. Reject anything that isn't root or the console
     // user before reading a single byte.
     if let peer = UnixSocket.peerEUID(fd) {
-        if !isAuthorizedPeer(uid: peer.uid, gid: peer.gid) {
+        if !HelperPeerAuth.isAuthorized(uid: peer.uid, consoleUID: consoleUserUID()) {
             log("REJECT connection from euid=\(peer.uid) egid=\(peer.gid) — not root or console user")
             // Still write a response so the (hostile) caller doesn't
             // see EOF and silently retry — they get an explicit "no".
