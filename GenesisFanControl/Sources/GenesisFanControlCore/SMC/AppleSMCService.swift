@@ -391,6 +391,12 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
     /// transition would briefly flash .constant in the UI.
     private var lastReleaseAt: [Int: Date] = [:]
 
+    /// Per-sensor last value that passed the ghost-value filter. Used
+    /// to hold the UI steady when M-series firmware power-gates a core
+    /// (sensor cache returns sentinel 1.9°C or -4°C) — without this
+    /// the temperature column would jitter wildly every tick.
+    private var lastValidSensor: [String: TempSensor] = [:]
+
     /// Floor used when we have to ask the helper to enter constant mode
     /// before sensor-based takes over driving — we don't want to spike
     /// the fan during the brief moment between the helper write and the
@@ -808,13 +814,45 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             ))
         }
 
-        // Real sensors
+        // Real sensors. On Apple Silicon (verified on M4 — sensors
+        // jumping 40 ↔ 1.9°C every tick), the firmware writes constant
+        // SENTINEL values into per-core SoC sensors when individual
+        // cores power-gate: 1.9°C (Float32 0x3FF33333) and -4.0°C
+        // (Float32 0xC0800000) are the two we've seen. They're not
+        // real temperatures — the cache holds them whenever the core
+        // hasn't woken in the last few ms. Stats / iStat Menus filter
+        // these the same way: any CPU sensor reading < 10°C is
+        // dismissed as ghost and we hold the last valid value.
+        // Off-chip sensors (battery, airport, storage, power) are
+        // never power-gated this way and pass through unchanged.
         var newSensors: [TempSensor] = []
         for (key, name, kind) in sensorKeys {
-            guard let c = readDouble(key) else { continue }
-            // Out-of-band readings (sensor not populated) — skip
-            guard c > -20, c < 130 else { continue }
-            newSensors.append(TempSensor(id: key, name: name, kind: kind, celsius: c))
+            guard let raw = readDouble(key) else {
+                // Read failed — re-publish last good if we have one
+                if let prev = lastValidSensor[key] {
+                    newSensors.append(prev)
+                }
+                continue
+            }
+            // Hard out-of-band guard (real sensor never reports outside this).
+            guard raw > -20, raw < 130 else {
+                if let prev = lastValidSensor[key] {
+                    newSensors.append(prev)
+                }
+                continue
+            }
+            // Ghost-value filter: CPU/GPU per-core sensors below 10°C
+            // are power-gated cache sentinels, not real readings.
+            let isCoreCpu = key.hasPrefix("Tp") || key.hasPrefix("Tg")
+            if isCoreCpu && raw < 10 {
+                if let prev = lastValidSensor[key] {
+                    newSensors.append(prev)
+                }
+                continue
+            }
+            let s = TempSensor(id: key, name: name, kind: kind, celsius: raw)
+            newSensors.append(s)
+            lastValidSensor[key] = s
         }
 
         // Virtual aggregates — avg/max across logical groups. These appear

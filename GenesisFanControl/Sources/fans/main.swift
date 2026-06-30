@@ -101,9 +101,26 @@ final class FansCLI {
     }
 
     private func cmdSensor(args: [String]) -> Int32 {
-        guard let id = args.first, let s = state.sensor(withID: id) else {
+        guard let id = args.first else {
             FileHandle.standardError.write(Data("Usage: fans sensor <sensorID>\n".utf8))
             return 64
+        }
+        // Re-tick a few times if the requested sensor is missing —
+        // M-series ghost-value filter drops power-gated core reads,
+        // so a fresh CLI process can fail on the first read if that
+        // core happens to be asleep. Three ticks at ~250ms gives the
+        // firmware time to wake it.
+        var sensor = state.sensor(withID: id)
+        var tries = 0
+        while sensor == nil && tries < 4 {
+            usleep(250_000)
+            state.tick()
+            sensor = state.sensor(withID: id)
+            tries += 1
+        }
+        guard let s = sensor else {
+            FileHandle.standardError.write(Data("sensor '\(id)' not present (power-gated? unknown ID?)\n".utf8))
+            return 1
         }
         print("Sensor : \(s.name)")
         print("SMC key: \(s.id)")
