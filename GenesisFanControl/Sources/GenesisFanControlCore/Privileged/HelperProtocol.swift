@@ -42,7 +42,15 @@ public enum HelperConstants {
     /// pinned CONSTANT back to AUTO whenever launchd restarted it —
     /// manifesting in the GUI as the "constant speed jumping around"
     /// bug. v6 helpers leave user state alone on respawn.
-    public static let protocolVersion = 6
+    /// v7 (2026-06-30): the cached-.constant preservation branch in
+    /// primeSnapshot was held regardless of SMC md value — so once a
+    /// fan was set to CONSTANT, setMode(.auto) could never take effect
+    /// (the per-tick reassertion would immediately re-push CONSTANT,
+    /// and thermalmonitord, locked out, would let temperatures crash
+    /// to ~1°C as feedback loops broke). v7 gates the cache hold on
+    /// md == 1; firmware reclaim to md=3 now correctly flips us back
+    /// to .auto. EMERGENCY upgrade.
+    public static let protocolVersion = 7
 }
 
 public enum HelperRequest: Codable {

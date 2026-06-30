@@ -774,23 +774,23 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             if case .sensorBased = existing?.mode {
                 mode = existing!.mode
                 displayedTarget = existing?.targetRPM ?? Int(target)
-            } else if case .constant(let cachedRPM) = existing?.mode, !inReleaseSettle {
-                // CACHED says we put the user into CONSTANT(cachedRPM).
-                // Hold that line regardless of md — if the firmware (or a
-                // misbehaving helper restart) flipped md back to 0/3
-                // behind our back, the reassertion loop at the bottom of
-                // primeSnapshot will rewrite the CONSTANT in the same
-                // tick. Dropping the cached intent on a transient md
-                // drift was the "fan jumps back to AUTO when helper
-                // crashes" bug. The `!inReleaseSettle` gate still lets a
-                // legitimate user-initiated AUTO release fall through
-                // (since the AUTO setMode path updates cached.mode to
-                // .auto before this branch is reached on the next tick).
+            } else if case .constant(let cachedRPM) = existing?.mode, md == 1, !inReleaseSettle {
+                // Cached + SMC agree we're user-forced — preserve the
+                // exact RPM the user pinned (firmware claw-back on
+                // F0Tg can return a lower value; we trust our cache).
+                //
+                // CRITICAL: this branch is gated on md == 1. If the
+                // user calls setMode(.auto), the helper drops F0Md=0
+                // and Ftst=0; thermalmonitord reclaims and md flips
+                // 1 → 3 within ~250ms-4s. From that moment onward,
+                // md != 1, this branch is skipped, and baseMode
+                // (.auto) wins. PREVIOUSLY this branch lacked the
+                // md == 1 gate and ran on EVERY tick, holding the
+                // cached .constant forever regardless of SMC state —
+                // the bug that killed the temperature feedback loop
+                // and made AUTO appear no-op.
                 mode = .constant(rpm: cachedRPM)
                 displayedTarget = cachedRPM
-                if md != 1 {
-                    Log.fans.warning("primeSnapshot fan=F\(i) anomaly — cached=.constant(\(cachedRPM)) but SMC \(modeKey(forFan: i))=\(md). Helper restart or firmware drift? Re-asserting on this tick.")
-                }
             } else {
                 mode = baseMode
                 displayedTarget = Int(target)

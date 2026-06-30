@@ -278,20 +278,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settings = SettingsStore.shared
         let state = AppState.shared
 
-        // Icon
+        // Icon. ALWAYS template — the menu bar uses templates so the
+        // glyph is auto-tinted to match light/dark menu-bar background.
+        // The previous `.color` style left isTemplate=false which made
+        // the symbol render as raw black pixels (invisible on dark menu
+        // bars; mis-aligned vertically because non-template images
+        // bypass the standard 22pt baseline). For "color" we use the
+        // fill variant; the actual color comes from the system.
         switch settings.menuBarIconStyle {
         case .color, .monochrome:
             let symbol = settings.menuBarIconStyle == .color ? "fanblades.fill" : "fanblades"
             button.image = NSImage(systemSymbolName: symbol,
                                    accessibilityDescription: "GenesisFanControl")
-            button.image?.isTemplate = (settings.menuBarIconStyle == .monochrome)
         case .temperature:
-            // Use a thermometer glyph + headline temp as the title; no
-            // standalone icon body.
+            // Use a thermometer glyph + headline temp as the title.
             button.image = NSImage(systemSymbolName: "thermometer.medium",
                                    accessibilityDescription: "GenesisFanControl")
-            button.image?.isTemplate = true
         }
+        button.image?.isTemplate = true
         button.imagePosition = .imageLeading
 
         // Title (right of the icon). Compose: optional fan readout +
@@ -328,7 +332,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        button.title = parts.isEmpty ? "" : " " + parts.joined(separator: " · ")
+        // Use NSAttributedString with explicit labelColor so the title
+        // adapts to menu-bar appearance — plain `button.title` falls
+        // back to black on the system's default font, which becomes
+        // invisible on a dark menu bar (the bug from screenshot #29:
+        // "38 °C · 43 °C" black on dark). labelColor resolves to the
+        // correct contrasting color at draw time, and we vertically-
+        // center it to the icon's baseline via NSFont.menuBarFont.
+        if parts.isEmpty {
+            button.title = ""
+            button.attributedTitle = NSAttributedString(string: "")
+        } else {
+            let titleText = " " + parts.joined(separator: " · ")
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.menuBarFont(ofSize: 0),
+                .foregroundColor: NSColor.labelColor,
+            ]
+            button.attributedTitle = NSAttributedString(string: titleText, attributes: attrs)
+        }
     }
 
     /// Hook SettingsStore + AppState into renderMenuBar() so every

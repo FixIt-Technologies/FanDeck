@@ -296,17 +296,23 @@ private extension SensorKind {
 
 // MARK: - Settings gear button
 
-/// Opens the Settings scene from a header button. macOS 14+ has the
-/// SwiftUI-native `SettingsLink` primitive that just works once the
-/// click actually arrives at the SwiftUI subtree (it wraps a private
-/// init of the Settings scene that the responder chain can find).
-/// All the prior NSApp.sendAction / showSettingsWindow: dispatch
-/// attempts were upstream of the lost-click bug — fixing the drag
-/// region was the load-bearing change. SettingsLink is the cleanest
-/// implementation once clicks arrive.
+/// Opens the Settings scene from a header button.
+///
+/// macOS 14 ships `SettingsLink` as the canonical way to invoke the
+/// Settings scene from inside a view, but it's BROKEN when the app's
+/// activation policy is `.accessory` (no dock icon) — clicking the
+/// link silently does nothing because there's no foreground regular
+/// app to host the Settings window. Verified empirically: the
+/// `GearButton tapped` log fires; no Settings window appears.
+///
+/// Workaround: a plain `Button` that (a) promotes the app to
+/// `.regular` momentarily and (b) dispatches `showSettingsWindow:` to
+/// the responder chain. This works regardless of starting policy.
 private struct GearButton: View {
     var body: some View {
-        SettingsLink {
+        Button {
+            openSettingsRobustly()
+        } label: {
             Image(systemName: "gearshape.fill")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(.gfcTextSecondary)
@@ -315,45 +321,32 @@ private struct GearButton: View {
         }
         .buttonStyle(.plain)
         .help("Open Settings (⌘,)")
-        // Diagnostic — fires on every press regardless of whether
-        // SettingsLink actually shows the window. If you see this in
-        // `log show` but no Settings window opens, the SettingsLink
-        // primitive is failing on your macOS rev and we need to fall
-        // back to the chained selectors below.
-        .simultaneousGesture(TapGesture().onEnded {
-            Log.ui.warning("GearButton tapped — SettingsLink primitive about to handle")
-            // Best-effort backup path. If SettingsLink works, this is
-            // a no-op (the window is already up); if SettingsLink
-            // silently fails on macOS 26 the selector chain will fire
-            // one of these branches.
-            NSApp.activate(ignoringOtherApps: true)
-            _ = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        })
     }
 
-    // Retained for reference / future fallback — currently unused
-    // because SettingsLink wins.
     private func openSettingsRobustly() {
-        // Diagnostic — if this line never appears in `log show` despite
-        // the user clicking the gear, the click is being eaten upstream
-        // of the SwiftUI Button (previously: title-bar drag region — see
-        // NoDragArea.swift for the fix). Keep this log around for one
-        // release; if no bug reports return after the NoDragArea wrap,
-        // demote to .debug or remove.
         Log.ui.warning("GearButton tapped — entering openSettingsRobustly()")
 
-        // Settings scene refuses to come forward unless we activate first
-        // in .accessory mode.
+        // The Settings scene won't render unless the app is .regular
+        // activation policy at the moment of dispatch. .accessory apps
+        // can have the scene REGISTERED but the window-server refuses
+        // to materialise its window. Promote unconditionally; the
+        // existing AppDelegate.applyActivationPolicy() restores the
+        // user's preference when the main window closes.
+        let prevPolicy = NSApp.activationPolicy()
+        if prevPolicy != .regular {
+            NSApp.setActivationPolicy(.regular)
+            Log.ui.debug("Settings: promoted \(prevPolicy.rawValue) → .regular for scene visibility")
+        }
         NSApp.activate(ignoringOtherApps: true)
 
         // 1) Modern selector (macOS 13+).
         if NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-            Log.ui.debug("Settings opened via showSettingsWindow:")
+            Log.ui.warning("Settings opened via showSettingsWindow:")
             return
         }
         // 2) Legacy selector (macOS ≤ 12 / fallback name).
         if NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil) {
-            Log.ui.debug("Settings opened via showPreferencesWindow:")
+            Log.ui.warning("Settings opened via showPreferencesWindow:")
             return
         }
         // 3) Walk the main Application menu for an item whose title looks
@@ -366,12 +359,12 @@ private struct GearButton: View {
                     sub.title.localizedCaseInsensitiveContains("preferences") {
                     if let action = sub.action {
                         let ok = NSApp.sendAction(action, to: sub.target, from: nil)
-                        Log.ui.debug("Settings opened via menu walk '\(sub.title)' → \(ok)")
+                        Log.ui.warning("Settings opened via menu walk '\(sub.title)' → \(ok)")
                         if ok { return }
                     }
                 }
             }
         }
-        Log.ui.error("Settings: all selector + menu-walk fallbacks failed")
+        Log.ui.error("Settings: all selector + menu-walk fallbacks failed (policy=\(NSApp.activationPolicy().rawValue))")
     }
 }
