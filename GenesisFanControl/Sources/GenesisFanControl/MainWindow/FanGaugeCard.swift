@@ -134,6 +134,16 @@ struct DraggableRPMGauge: View {
                     .shadow(color: fan.loadColor.opacity(0.3), radius: 2)
                     .animation(.easeOut(duration: 1.0), value: displayedFraction)
 
+                // Sensor-based: faint ticks at each ramp vertex's RPM so
+                // the user sees the whole curve's "stops" (the RPM range
+                // the fan will sweep across temperature), not just the one
+                // live target. Drawn BELOW the live wall so the active
+                // target stays the prominent marker.
+                ForEach(rampWallRPMs(), id: \.self) { rpm in
+                    let x = positionFor(rpm: rpm, totalWidth: geo.size.width)
+                    RampTick(x: x, height: height, color: .gfcCyan.opacity(0.45))
+                }
+
                 // Setpoint wall — amber for manual constant, cyan for the
                 // live sensor-based target. Always shows the RPM label so
                 // the user can read exactly where the fan is being pinned.
@@ -193,6 +203,15 @@ struct DraggableRPMGauge: View {
         return nil
     }
 
+    /// RPM of each ramp vertex for sensor-based mode (clamped into the
+    /// fan envelope, de-duplicated). Empty for auto/constant — only the
+    /// sensor curve has multiple "stops" worth showing on the bar.
+    private func rampWallRPMs() -> [Int] {
+        guard case .sensorBased(_, let points) = fan.mode else { return [] }
+        let clamped = points.map { max(fan.minRPM, min(fan.maxRPM, $0.rpm)) }
+        return Array(Set(clamped)).sorted()
+    }
+
     /// One marker describes the wall: where it is on the bar, what RPM
     /// it represents, what color, and the text under it. Manual (drag or
     /// constant) is amber; the sensor-based dynamic target is cyan.
@@ -234,6 +253,25 @@ struct DraggableRPMGauge: View {
         guard fan.maxRPM > fan.minRPM else { return 0 }
         let pct = CGFloat(max(0, min(1, Double(rpm - fan.minRPM) / Double(fan.maxRPM - fan.minRPM))))
         return pct * totalWidth
+    }
+}
+
+// MARK: - Ramp tick (faint vertex marker for sensor-based mode)
+
+/// A thin static tick at a ramp vertex's RPM. Several of these show the
+/// sweep range of a sensor curve on the 1-D RPM bar; the live target is
+/// still drawn as the prominent SetpointWall on top.
+private struct RampTick: View {
+    let x: CGFloat
+    let height: CGFloat
+    let color: Color
+
+    var body: some View {
+        Rectangle()
+            .fill(color)
+            .frame(width: 2, height: height + 4)
+            .offset(x: x - 1, y: -2)
+            .allowsHitTesting(false)
     }
 }
 

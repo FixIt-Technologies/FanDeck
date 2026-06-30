@@ -42,6 +42,10 @@ struct FanControlSheet: View {
     /// failure etc.). All read-only — user edits stay in @State above.
     private var fan: Fan { appState.fan(withID: fanID) ?? initialFan }
 
+    /// Name for the ramp-chart overlay coordinate space so draggable
+    /// handles report a location independent of their .position offset.
+    private let rampPlotSpace = "gfcRampPlot"
+
     enum ModeChoice: String, CaseIterable, Identifiable {
         case auto, constant, sensor
         var id: String { rawValue }
@@ -277,32 +281,29 @@ struct FanControlSheet: View {
                 .fill(pointColor(at: i))
                 .frame(width: 10, height: 10)
                 .shadow(color: pointColor(at: i).opacity(0.7), radius: 3)
-            // Temp stepper
-            HStack(spacing: 2) {
-                Text("at")
-                    .font(.system(size: 11))
-                    .foregroundColor(.gfcTextMuted)
-                Stepper(value: binding.tempC, in: 0...120, step: 1) {
-                    Text("\(Int(points[i].tempC)) °C")
-                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                        .foregroundColor(.gfcText)
-                        .frame(minWidth: 56, alignment: .trailing)
-                }
+            // Temp: explicit value Text + a labels-hidden Stepper. The
+            // value MUST live outside the Stepper — `.labelsHidden()`
+            // hides the Stepper's label, which is exactly where the old
+            // code put the "45 °C" text, so it rendered blank.
+            Text("at")
+                .font(.system(size: 11))
+                .foregroundColor(.gfcTextMuted)
+            Text("\(Int(points[i].tempC)) °C")
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundColor(.gfcText)
+                .frame(minWidth: 52, alignment: .trailing)
+            Stepper("", value: binding.tempC, in: 0...120, step: 1)
                 .labelsHidden()
-            }
             Text("→")
                 .font(.system(size: 11))
                 .foregroundColor(.gfcTextMuted)
-            // RPM stepper (step 50 RPM)
-            Stepper(value: binding.rpm,
-                    in: fan.minRPM...fan.maxRPM,
-                    step: 50) {
-                Text("\(points[i].rpm) RPM")
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.gfcText)
-                    .frame(minWidth: 80, alignment: .trailing)
-            }
-            .labelsHidden()
+            // RPM: same pattern.
+            Text("\(points[i].rpm) RPM")
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundColor(.gfcText)
+                .frame(minWidth: 74, alignment: .trailing)
+            Stepper("", value: binding.rpm, in: fan.minRPM...fan.maxRPM, step: 50)
+                .labelsHidden()
             Spacer()
             Button {
                 deletePoint(at: i)
@@ -494,6 +495,11 @@ struct FanControlSheet: View {
                             handle(at: i, proxy: proxy, frame: frame, xMin: xMin, xMax: xMax)
                         }
                     }
+                    // Named space so each handle's DragGesture reports a
+                    // location in THIS overlay's coordinates regardless of
+                    // where .position places the handle — matches `frame`
+                    // (geo[plot], same space) for the proxy conversion.
+                    .coordinateSpace(name: rampPlotSpace)
                 }
             }
         }
@@ -521,9 +527,15 @@ struct FanControlSheet: View {
                     .frame(width: 14, height: 14)
                     .shadow(color: color.opacity(0.85), radius: 4)
             }
-            .position(x: cx, y: cy)
-            .contentShape(Circle().path(in: CGRect(x: -8, y: -8, width: 32, height: 32)))
+            // Generous 40pt hit target + contentShape + gesture applied
+            // BEFORE .position so the draggable region sits ON the dot
+            // (the old code applied contentShape AFTER .position, which
+            // put a 32pt hit circle at the plot's corner — nowhere near
+            // the handle — so nothing was draggable).
+            .frame(width: 40, height: 40)
+            .contentShape(Circle())
             .gesture(dragGesture(forPointAt: i, proxy: proxy, frame: frame, xMin: xMin, xMax: xMax))
+            .position(x: cx, y: cy)
             .contextMenu {
                 if points.count > 2 {
                     Button(role: .destructive) {
@@ -538,7 +550,12 @@ struct FanControlSheet: View {
 
     private func dragGesture(forPointAt i: Int, proxy: ChartProxy, frame: CGRect,
                              xMin: Double, xMax: Double) -> some Gesture {
-        DragGesture(minimumDistance: 0)
+        // coordinateSpace: .named(rampPlotSpace) → drag.location is in the
+        // overlay's coordinate space (same as `frame`), so subtracting
+        // frame.minX/minY gives a plot-relative point the ChartProxy can
+        // invert. Without the named space the location would be relative
+        // to the .position'd handle and the math would be garbage.
+        DragGesture(minimumDistance: 0, coordinateSpace: .named(rampPlotSpace))
             .onChanged { drag in
                 guard i < points.count else { return }
                 let inChartX = drag.location.x - frame.minX
@@ -589,34 +606,58 @@ struct FanControlSheet: View {
             Button("Cancel") { dismiss() }
                 .buttonStyle(SecondaryButtonStyle())
                 .keyboardShortcut(.cancelAction)
-            Button("Apply") {
-                // Persist the sensor-based config whenever the user has
-                // touched it — even if the active mode they're applying is
-                // constant or auto. That way switching back to sensor-based
-                // later restores exactly what they had configured.
-                let sortedPts = points.sorted(by: { $0.tempC < $1.tempC })
-                settings.saveSensorRampConfig(
-                    SensorRampConfig(sensorId: sensorID, points: sortedPts),
-                    for: fan.id)
-                appState.setMode(applyMode(), for: fan.id)
-                dismiss()
+            // Only show "Apply to all" when there's more than one fan —
+            // on a single-fan Mac it's redundant.
+            if appState.fans.count > 1 {
+                Button("Apply to all") { apply(toAll: true) }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .help("Apply this mode to every fan")
             }
-            .buttonStyle(PrimaryButtonStyle())
-            .keyboardShortcut(.defaultAction)
+            Button("Apply") { apply(toAll: false) }
+                .buttonStyle(PrimaryButtonStyle())
+                .keyboardShortcut(.defaultAction)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
         .background(Color.gfcSidebar.opacity(0.6))
     }
 
+    /// Apply the configured mode to this fan, or to every fan when
+    /// `toAll` is true. Persists the sensor-based config per fan so a
+    /// later re-open restores exactly what was set.
+    private func apply(toAll: Bool) {
+        let sortedPts = points.sorted(by: { $0.tempC < $1.tempC })
+        let targets: [Fan] = toAll ? appState.fans : [fan]
+        for f in targets {
+            // Re-clamp the mode's RPMs into each fan's own envelope —
+            // fans can have different min/max, so the same target/ramp
+            // must be range-fit per fan.
+            settings.saveSensorRampConfig(
+                SensorRampConfig(sensorId: sensorID, points: sortedPts),
+                for: f.id)
+            appState.setMode(applyMode(for: f), for: f.id)
+        }
+        dismiss()
+    }
+
     // MARK: - Helpers
 
-    private func applyMode() -> FanMode {
+    private func applyMode() -> FanMode { applyMode(for: fan) }
+
+    /// Build the mode to apply, clamped into `target`'s RPM envelope so
+    /// the same setting fits fans with different min/max ranges.
+    private func applyMode(for target: Fan) -> FanMode {
         switch mode {
-        case .auto: return .auto
-        case .constant: return .constant(rpm: Int(constantRPM.rounded()))
+        case .auto:
+            return .auto
+        case .constant:
+            let rpm = max(target.minRPM, min(target.maxRPM, Int(constantRPM.rounded())))
+            return .constant(rpm: rpm)
         case .sensor:
-            let pts = points.sorted(by: { $0.tempC < $1.tempC })
+            let pts = points
+                .sorted(by: { $0.tempC < $1.tempC })
+                .map { RampPoint(tempC: $0.tempC,
+                                 rpm: max(target.minRPM, min(target.maxRPM, $0.rpm))) }
             return .sensorBased(sensorId: sensorID, points: pts)
         }
     }
