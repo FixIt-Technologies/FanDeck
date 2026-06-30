@@ -88,6 +88,17 @@ public final class AppState: ObservableObject {
     /// Refresh from SMC. Dispatches the slow read pass to the SMC queue
     /// and republishes on the main actor. Safe to call from main.
     public func tick() {
+        // Suppress polling ticks while a user-initiated write is in flight.
+        // unlockFanControl can sleep up to ~10s on Apple Silicon (3s wait
+        // for thermalmonitord + 300×100ms confirm loop). Without this
+        // guard, the 1Hz polling timer queues 8+ ticks behind a single
+        // setMode and they all drain in a 100ms burst on completion, each
+        // one publishing a fresh snapshot to the UI → gauge flicker.
+        // Both `inFlightCount` and tick() are @MainActor → race-free.
+        guard inFlightCount == 0 else {
+            Log.lifecycle.debug("tick suppressed — \(inFlightCount) write(s) in flight")
+            return
+        }
         let smc = self.smc
         let helperClient = self.helperClient
         smcQueue.async { [weak self] in
@@ -251,7 +262,14 @@ public final class AppState: ObservableObject {
             let clamped = max(fans[i].minRPM, min(fans[i].maxRPM, rpm))
             fans[i].mode = .constant(rpm: clamped)
             fans[i].targetRPM = clamped
-            fans[i].currentRPM = clamped
+            // Deliberately DO NOT touch fans[i].currentRPM here. Previously
+            // we set currentRPM = clamped to make the green fill snap to
+            // the target, but the SetpointWall already telegraphs intent,
+            // and a few seconds later setMode's completion publishes the
+            // real (lower) currentRPM and the fill visibly DROPS — looks
+            // like the bar is "jumping". Let the fill track physical RPM
+            // honestly; it will animate up to the target over the next
+            // 1–3 polling ticks.
             intent = PendingIntent(mode: .constant(rpm: clamped), targetRPM: clamped, token: token)
         case .sensorBased:
             fans[i].mode = mode

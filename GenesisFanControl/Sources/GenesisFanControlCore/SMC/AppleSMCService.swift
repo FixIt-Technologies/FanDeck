@@ -774,9 +774,23 @@ public final class AppleSMCService: SMCService, @unchecked Sendable {
             if case .sensorBased = existing?.mode {
                 mode = existing!.mode
                 displayedTarget = existing?.targetRPM ?? Int(target)
-            } else if case .constant(let cachedRPM) = existing?.mode, md == 1, !inReleaseSettle {
+            } else if case .constant(let cachedRPM) = existing?.mode, !inReleaseSettle {
+                // CACHED says we put the user into CONSTANT(cachedRPM).
+                // Hold that line regardless of md — if the firmware (or a
+                // misbehaving helper restart) flipped md back to 0/3
+                // behind our back, the reassertion loop at the bottom of
+                // primeSnapshot will rewrite the CONSTANT in the same
+                // tick. Dropping the cached intent on a transient md
+                // drift was the "fan jumps back to AUTO when helper
+                // crashes" bug. The `!inReleaseSettle` gate still lets a
+                // legitimate user-initiated AUTO release fall through
+                // (since the AUTO setMode path updates cached.mode to
+                // .auto before this branch is reached on the next tick).
                 mode = .constant(rpm: cachedRPM)
                 displayedTarget = cachedRPM
+                if md != 1 {
+                    Log.fans.warning("primeSnapshot fan=F\(i) anomaly — cached=.constant(\(cachedRPM)) but SMC \(modeKey(forFan: i))=\(md). Helper restart or firmware drift? Re-asserting on this tick.")
+                }
             } else {
                 mode = baseMode
                 displayedTarget = Int(target)

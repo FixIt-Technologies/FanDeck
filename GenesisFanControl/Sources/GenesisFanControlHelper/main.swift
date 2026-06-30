@@ -34,7 +34,13 @@ log("genesis-fan-control-helper starting (uid=\(getuid()))")
 // helperClient: nil — we ARE the helper. Without this the helper's own
 // AppleSMCService would try to connect to its own socket on any
 // fallback path and deadlock.
-guard let smc = AppleSMCService(helperClient: nil) else {
+// forceSafeReset: false — launchd respawns the helper on every crash
+// (KeepAlive=true). With forceSafeReset=true every respawn would call
+// safeResetAllFansToAuto(), silently wiping the user's pinned CONSTANT
+// back to AUTO and producing the "constant speed jumping around" bug.
+// Cold-start safety is the GUI's job (its AppleSMCService default IS
+// true); the helper just executes commands.
+guard let smc = AppleSMCService(helperClient: nil, forceSafeReset: false) else {
     log("FATAL: AppleSMCService failed to open")
     exit(1)
 }

@@ -36,7 +36,13 @@ public enum HelperConstants {
     /// watchdog timer — the source was scheduled on stateQueue and its
     /// handler called stateQueue.sync, crashing libdispatch every ~60s.
     /// Watchdog now has its own dedicated queue.
-    public static let protocolVersion = 5
+    /// v6 (2026-06-30): pass `forceSafeReset: false` to the helper's own
+    /// AppleSMCService. The old v5 helper called safeResetAllFansToAuto
+    /// on every respawn (KeepAlive=true), silently wiping the user's
+    /// pinned CONSTANT back to AUTO whenever launchd restarted it —
+    /// manifesting in the GUI as the "constant speed jumping around"
+    /// bug. v6 helpers leave user state alone on respawn.
+    public static let protocolVersion = 6
 }
 
 public enum HelperRequest: Codable {

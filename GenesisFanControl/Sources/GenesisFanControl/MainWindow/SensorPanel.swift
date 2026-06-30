@@ -71,7 +71,13 @@ struct SensorPanel: View {
             // selector, and finally walks the application menu for any
             // item whose title contains "Settings" or "Preferences" —
             // one of those always fires.
-            GearButton()
+            //
+            // The NoDragArea wrap is load-bearing: the gear lives at
+            // y≈14, inside the hidden-title-bar drag region. Without it,
+            // AppKit eats every click as a window-drag gesture before
+            // SwiftUI's Button can react. See NoDragArea.swift.
+            NoDragArea { GearButton() }
+                .frame(width: 24, height: 24)
         }
         .padding(.horizontal, 12)
         // Same height as the topStatusBar — TEMPERATURES sits on the
@@ -300,6 +306,14 @@ private struct GearButton: View {
     }
 
     private func openSettingsRobustly() {
+        // Diagnostic — if this line never appears in `log show` despite
+        // the user clicking the gear, the click is being eaten upstream
+        // of the SwiftUI Button (previously: title-bar drag region — see
+        // NoDragArea.swift for the fix). Keep this log around for one
+        // release; if no bug reports return after the NoDragArea wrap,
+        // demote to .debug or remove.
+        Log.ui.warning("GearButton tapped — entering openSettingsRobustly()")
+
         // Settings scene refuses to come forward unless we activate first
         // in .accessory mode.
         NSApp.activate(ignoringOtherApps: true)
