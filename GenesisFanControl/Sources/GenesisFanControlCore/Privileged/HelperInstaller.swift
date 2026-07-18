@@ -57,12 +57,26 @@ public enum HelperInstaller {
     public static func install() throws {
         let helperBinary = try locateHelperBinary()
 
+        // Stage the helper into a world-readable temp dir first. The dev
+        // build lives under ~/Documents, which the root shell spawned by
+        // osascript cannot read (root has no TCC grant for the user's
+        // Documents) — its cp fails with "Operation not permitted". This
+        // process DOES hold the grant, so copy with user privileges, then
+        // let the privileged script install from the staged path.
+        let stagingDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("genesis-fan-control-install", isDirectory: true)
+        let stagedHelper = stagingDir.appendingPathComponent("genesis-fan-control-helper")
+        try? FileManager.default.removeItem(at: stagingDir)
+        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(atPath: helperBinary, toPath: stagedHelper.path)
+        defer { try? FileManager.default.removeItem(at: stagingDir) }
+
         // Escape every interpolated path the way bash single-quote-bracketed
         // strings expect: `'` → `'\''`. Without this, a username/dev path
         // containing an apostrophe (Genesis' Projects / O'Brien / Martin's
         // MacBook) breaks out of the string and either fails the script or,
         // worse, runs whatever follows as a shell command.
-        let helperQ      = shellEscape(helperBinary)
+        let helperQ      = shellEscape(stagedHelper.path)
         let installedQ   = shellEscape(HelperConstants.installedHelperPath)
         let launchdQ     = shellEscape(HelperConstants.launchDaemonPath)
         let labelLiteral = HelperConstants.helperLabel
