@@ -13,7 +13,7 @@ Intel Macs; the write path's Apple-Silicon `Ftst` dance is a no-op there.
 ## Quick start
 
 ```bash
-cd apps/GenesisFanControl
+cd GenesisFanControl
 bun install         # nothing actually pulled — only scripts/ has TS
 bun run start       # build release + install /Applications/.app + launch
 ```
@@ -41,7 +41,7 @@ fans watch                      # 1Hz tail of RPMs + headline sensor
 ## Project layout
 
 ```
-apps/GenesisFanControl/
+GenesisFanControl/
 ├── Package.swift                  # SPM manifest — 3 executables + library + tests
 ├── package.json                   # Bun-driven build / install / dev scripts
 ├── README.md                      # this file
