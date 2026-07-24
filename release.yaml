@@ -1,0 +1,11 @@
+# pultik ship manifest — `pultik ship` from the repo root publishes
+# FanDeck.app (with the embedded fan-control helper) to apps.fixit.app.
+app: fandeck
+name: FanDeck
+icon: "🌀"
+description: Condensed menu-bar-first macOS fan control — live sliders, drag-to-set gauges, sensor ramps. Apple Silicon SMC.
+platform: macos
+channel: stable
+build: ./scripts/dist.sh
+artifact: dist/FanDeck.zip
+version: 1.0.0
