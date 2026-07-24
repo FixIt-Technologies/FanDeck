@@ -3,6 +3,7 @@
 app: fandeck
 name: FanDeck
 icon: "🌀"
+icon_file: FanDeck/Resources/marketplace-icon.png
 description: Condensed menu-bar-first macOS fan control — live sliders, drag-to-set gauges, sensor ramps. Apple Silicon SMC.
 platform: macos
 channel: stable
