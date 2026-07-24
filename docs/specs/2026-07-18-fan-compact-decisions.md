@@ -3,7 +3,7 @@
 ## Summary
 **FanDeck**: a new condensed-UI macOS fan-control app built on top of `apps/GenesisFanControl`. SwiftUI + Tuist, full feature parity (auto / constant / sensor-ramp modes, drag-to-set, ramp curve editor, sensors, helper daemon), menu-bar-first with a rich control panel, and a compact mini-gauge window.
 
-Board: https://vitrinka.in/w/fixit/boards/genesis-fan-compact-brainstorm
+Board: internal brainstorm board (vitrinka)
 
 ## Decisions
 
