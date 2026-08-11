@@ -6,3 +6,5 @@ Tuist/.build/
 .tuist-cache/
 xcuserdata/
 GenesisFanControl/scripts/AppIcon.iconset/
+GenesisFans.xcworkspace/
+dist/
