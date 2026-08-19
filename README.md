@@ -25,10 +25,11 @@ so a downloaded build needs a Gatekeeper override.
 
 ## Quickstart
 
-Prerequisites: macOS 14+, a recent Xcode (`Tuist/Package.swift` is
-swift-tools-version 6.0), [Tuist](https://tuist.dev) (`brew install tuist`), and
-[Bun](https://bun.sh) for the GenesisFanControl scripts. No env vars, no `.env`,
-no secrets — nothing to configure.
+Prerequisites: macOS 14+ and a Swift 6 toolchain — Xcode Command Line Tools are
+enough for the core/CLI/tests below; Xcode.app itself (plus
+[Tuist](https://tuist.dev), `brew install tuist`) is needed only to build
+**FanDeck.app**. [Bun](https://bun.sh) runs the GenesisFanControl scripts. No env
+vars, no `.env`, no secrets — nothing to configure.
 
 Build and run the **core, CLI and tests** without Xcode at all:
 

@@ -21,7 +21,7 @@
 
 ## Fan writes are real hardware
 
-`Sources/GenesisFanControlCore/SMC/` and `.../Privileged/` drive a physical machine.
+`GenesisFanControl/Sources/GenesisFanControlCore/SMC/` and `.../Privileged/` drive a physical machine.
 Read `GenesisFanControl/README.md` (SMC backend + helper sections) before editing
 there — the `Ftst` unlock sequence, its release *order*, and the per-tick
 re-assertion against `thermalmonitord` are load-bearing and counter-intuitive.
